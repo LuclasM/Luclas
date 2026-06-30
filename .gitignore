@@ -1,0 +1,25 @@
+# Local environment variables
+.env
+
+# Local business-specific policy override (never tracked)
+data/core.local.md
+
+# Runtime data
+data/*.db
+data/core_history/
+data/raw/
+data/sessions/
+data/upgrade_trigger.json
+working/
+sessions/
+.eva_history
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Misc scratch files
+*.html
+*.pdf
+cookies*.txt
