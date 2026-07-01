@@ -38,9 +38,10 @@ VERSION      = f"{_VERSION_BASE}.{_build}"
 VERSION_DATE = _date
 DATA_DIR     = os.path.join(BASE_DIR, "data")
 DB_PATH      = os.path.join(DATA_DIR, "eva4.db")
-CORE_PATH    = os.path.join(DATA_DIR, "core.md")
-CORE_LOCAL_PATH = os.path.join(DATA_DIR, "core.local.md")
-CORE_HIST    = os.path.join(DATA_DIR, "core_history")
+CORE_PATH        = os.path.join(DATA_DIR, "core.md")
+CORE_LOCAL_PATH  = os.path.join(DATA_DIR, "core.local.md")
+CORE_HIST        = os.path.join(DATA_DIR, "core_history")
+REFLECT_PATH     = os.path.join(DATA_DIR, "reflect.md")
 RAW_DIR      = os.path.join(DATA_DIR, "raw")
 SESSION_DIR  = os.path.join(DATA_DIR, "sessions")
 

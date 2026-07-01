@@ -7,8 +7,9 @@ import readline
 import sys
 import uuid
 
-from config import (DB_PATH, DATA_DIR, CORE_PATH, CORE_LOCAL_PATH, CORE_HIST, RAW_DIR, SESSION_DIR,
-                    LLM_BASE_URL, LLM_MODEL, AGENT_MAX_ITERATIONS, VERSION, VERSION_DATE)
+from config import (DB_PATH, DATA_DIR, CORE_PATH, CORE_LOCAL_PATH, CORE_HIST, REFLECT_PATH,
+                    RAW_DIR, SESSION_DIR, LLM_BASE_URL, LLM_MODEL, AGENT_MAX_ITERATIONS,
+                    VERSION, VERSION_DATE)
 from llm_client import LLMClient
 from memory.database import init_db
 from memory.store import MemoryStore, TaskStore
@@ -44,12 +45,15 @@ def _touch_active() -> None:
 
 
 def _reflect_goal() -> str:
+    protocol = ""
+    if os.path.isfile(REFLECT_PATH):
+        with open(REFLECT_PATH, encoding="utf-8") as f:
+            protocol = f"\n\n---\n{f.read()}"
     return (
-        "Perform a comprehensive strategic reflection following core.md Chapter 12 "
-        "(全面反思策略 / Comprehensive Reflection Strategy). "
-        "Collect task statistics, review AAR memories, surface pending upgrade-assessment "
-        "recommendations, and improve core.md where evidence supports it. "
+        "Perform a comprehensive strategic reflection on EVA4's recent performance. "
+        "Follow the protocol below exactly — do not skip data collection. "
         "Do not modify any .py files or suggest code changes."
+        + protocol
     )
 
 
