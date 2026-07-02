@@ -87,6 +87,11 @@ tools/                  shell/python/file/search/http/web/memory tool implementa
 utils/display.py       terminal color helpers
 ```
 
+## Roadmap
+
+- [ ] **Popular LLM support** — first-class integration with OpenAI, Anthropic Claude, Google Gemini, and other hosted providers (currently works with any OpenAI-compatible endpoint)
+- [ ] **Popular messaging platforms** — Telegram, Slack, Discord, and other chat platforms (WeCom/企业微信 is the first adapter; more coming)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
