@@ -529,7 +529,13 @@ def _schedule_cmd(sub: str, rest: str):
 
 
 def _bootstrap_core(llm: LLMClient):
-    prompt = """You are Luclas, an experience-driven assistant. Generate your own core policy file (core.md).
+    user_dir_path = os.path.join(DATA_DIR, "user_direction.md")
+    user_section = ""
+    if os.path.isfile(user_dir_path):
+        with open(user_dir_path, encoding="utf-8") as f:
+            user_section = f"\n\nUser context (from setup):\n{f.read()}"
+
+    prompt = f"""You are Luclas, an experience-driven assistant. Generate your own core policy file (core.md).
 
 Content should include:
 - Identity description
@@ -540,7 +546,7 @@ Content should include:
 - Long-text handling strategy
 - Policy update rules
 
-Requirements: concise and actionable, every rule should directly guide behavior, avoid empty statements."""
+Requirements: concise and actionable, every rule should directly guide behavior, avoid empty statements.{user_section}"""
     try:
         content = llm.chat([{"role": "user", "content": prompt}], temperature=0.3)
         with open(CORE_PATH, "w", encoding="utf-8") as f:
@@ -670,7 +676,10 @@ def _stop_print_logger():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if args and args[0] == "--reflect":
+    if args and args[0] == "setup":
+        from setup import run as _run_setup
+        _run_setup(BASE_DIR)
+    elif args and args[0] == "--reflect":
         _run_headless(_reflect_goal())
     elif args and args[0] == "--run" and len(args) > 1:
         _run_headless(args[1])
