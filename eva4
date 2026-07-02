@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec python3 "$(dirname "$(realpath "$0")")/eva/eva.py" "$@"

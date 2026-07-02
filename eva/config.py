@@ -2,9 +2,13 @@ import os
 import subprocess
 
 
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))   # eva/
+BASE_DIR = os.path.dirname(CODE_DIR)                     # EVA4/  (repo root, data root)
+
+
 def _load_dotenv() -> None:
     """Minimal .env loader (no external dependency)."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    env_path = os.path.join(BASE_DIR, ".env")
     if not os.path.isfile(env_path):
         return
     with open(env_path, encoding="utf-8") as f:
@@ -17,8 +21,6 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
-
-BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 
 
 def _git(args: list[str]) -> str:
