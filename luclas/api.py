@@ -38,7 +38,9 @@ from loops.task_runner import TaskRunner
 app = FastAPI(title="Luclas API", version="1.0", docs_url="/docs")
 
 from adapters.wecom import router as wecom_router
+from adapters.whatsapp import router as whatsapp_router
 app.include_router(wecom_router)
+app.include_router(whatsapp_router)
 
 _API_KEY = os.environ.get("LUC_API_KEY", "")
 
@@ -69,6 +71,8 @@ def _startup() -> None:
     _store       = MemoryStore()
     _task_store  = TaskStore()
     _task_memory = TaskMemory()
+    from adapters.discord_adapter import start_bot as _start_discord
+    _start_discord()
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +173,10 @@ class CommandRequest(BaseModel):
 @app.post("/command", dependencies=[Depends(_auth)])
 def run_command(req: CommandRequest):
     """Run a slash command synchronously and return its text output."""
-    import io, contextlib, re
-    from luclas import _handle_slash
+    import io, contextlib, sys
+    from luclas import (
+        _handle_slash, _show_status, _show_tasks, _show_history,
+    )
     schemas, fns = build_tools(_store)
     buf = io.StringIO()
     try:
@@ -188,6 +194,8 @@ def run_command(req: CommandRequest):
         pass
     except Exception as e:
         return {"output": f"❌ {e}"}
+    # Strip ANSI colour codes
+    import re
     text = re.sub(r'\x1b\[[0-9;]*m', '', buf.getvalue()).strip()
     return {"output": text or "✅ 完成"}
 

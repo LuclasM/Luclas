@@ -39,7 +39,7 @@ SCHEDULE_ADD_SCHEMA = {
                 },
                 "notify_channel": {
                     "type": "string",
-                    "description": "Where to send the result when the task fires. 'terminal' for CLI session, 'wecom:<user_id>' for WeCom (e.g. 'wecom:Alice'). Default: 'terminal'.",
+                    "description": "Where to send the result when the task fires. Options: 'terminal' (CLI), 'wecom:<user_id>', 'whatsapp:<phone>', 'discord:<user_id>'. Default: 'terminal'.",
                     "default": "terminal",
                 },
             },
