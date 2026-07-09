@@ -119,18 +119,25 @@ _LLM_OPTIONS = [
 
 
 def _fetch_openai_models(base_url: str, api_key: str = "") -> list[str]:
-    """Try GET /models on an OpenAI-compatible endpoint. Returns [] on failure."""
+    """Try /v1/models then /models on an OpenAI-compatible endpoint. Returns [] on failure."""
     import json, urllib.request
-    try:
-        req = urllib.request.Request(
-            base_url.rstrip("/") + "/models",
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-        )
-        with urllib.request.urlopen(req, timeout=4) as r:
-            data = json.loads(r.read())
-            return sorted(m["id"] for m in data.get("data", []))
-    except Exception:
-        return []
+    hdrs = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    base = base_url.rstrip("/")
+    candidates = []
+    if not base.endswith("/v1"):
+        candidates.append(base + "/v1/models")
+    candidates.append(base + "/models")
+    for url in candidates:
+        try:
+            req = urllib.request.Request(url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=4) as r:
+                data = json.loads(r.read())
+                models = data.get("data", [])
+                if models:
+                    return sorted(m["id"] for m in models)
+        except Exception:
+            continue
+    return []
 
 
 def _fetch_ollama_models() -> list[str]:
@@ -412,19 +419,33 @@ def _write_direction(base_dir: str, note: str) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def run(base_dir: str) -> None:
+    import sys as _sys
     from i18n import ascii_banner
     print(ascii_banner())
     print("  ┌──────────────────────────────────────────────────┐")
     print("  │              Setup Wizard                        │")
     print("  └──────────────────────────────────────────────────┘")
     print()
-    print("  We'll configure your LLM, messaging platform, and")
-    print("  usage preferences. This writes to .env in the repo root.")
+    print("  Steps: 1) LLM models  2) Messaging platform  3) Usage preferences")
     print("  Press Ctrl-C at any time to cancel.")
 
     env_vars: dict[str, str] = {}
 
-    env_vars.update(_step_llm())
+    # ── Step 1: LLM models (interactive manager) ──────────────────────────────
+    _section("Step 1 · LLM Model Configuration")
+    print("  Add one or more LLM models. Models are saved to data/models.json.")
+    print("  Navigation: UP/DOWN arrows · a=add · e/Enter=edit · d=delete · q=done")
+    print()
+    _input("  Press Enter to open the model manager…")
+
+    if _sys.stdin.isatty():
+        from model_manager import run as _run_model_mgr
+        _run_model_mgr()
+    else:
+        print("  (non-interactive — falling back to single-model setup)")
+        env_vars.update(_step_llm())
+
+    # ── Steps 2–3: messaging + preferences ───────────────────────────────────
     env_vars.update(_step_messaging())
     pref_vars, direction = _step_preferences()
     env_vars.update(pref_vars)
@@ -434,8 +455,9 @@ def run(base_dir: str) -> None:
     _write_direction(base_dir, direction)
 
     print()
-    print("  ✓  .env updated")
-    print("  ✓  data/user_direction.md saved")
+    print("  ✓  data/models.json  (LLM models)")
+    print("  ✓  .env              (messaging & preferences)")
+    print("  ✓  data/user_direction.md")
     print()
     print("  All done. Run `luclas` to start.")
     print()
