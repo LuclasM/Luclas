@@ -149,6 +149,7 @@ def help_text() -> str:
   /tasks                  View task records
   /history                View work history (latest 20 task records)
   /log <task_id>          View task execution log
+  /models                 Show configured LLM models
   /reflect                Full strategic reflection — improves core.md methodology
   /schedule               Manage scheduled tasks
   /reset                  Clear all memory and tasks (requires confirmation)
@@ -168,6 +169,7 @@ def help_text() -> str:
   /tasks                  查看任务记录
   /history                查看工作历史（最近 20 条任务记录）
   /log <task_id>          查看任务执行日志
+  /models                 查看已配置的大模型
   /reflect                全面反思，改进 core.md 方法论
   /schedule               管理定时任务
   /reset                  清除所有记忆和任务（需确认）
@@ -347,6 +349,10 @@ def status_history(active, running, archived, summarized, summaries) -> str:
         f"summarized {summarized} | {summaries} summary block(s)",
         f"  工作历史：  活跃 {active} | 进行中 {running} | 归档 {archived} | 压缩 {summarized} | 摘要 {summaries} 段",
     )
+
+
+def models_title(n: int) -> str:
+    return _pick(f"Model Configuration ({n})", f"模型配置（{n} 个）")
 
 
 def whoami_title() -> str:

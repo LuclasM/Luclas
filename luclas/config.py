@@ -57,6 +57,8 @@ AGENT_MAX_ITERATIONS = 100
 AGENT_STALL_WINDOW   = 5
 AGENT_MAX_ERRORS     = 5
 
+MODELS_CONFIG_PATH = os.path.join(DATA_DIR, "models.json")
+
 EMBED_MODEL = os.environ.get(
     "LUC_EMBED_MODEL",
     "BAAI/bge-small-zh-v1.5" if LANG == "zh" else "paraphrase-multilingual-MiniLM-L12-v2",

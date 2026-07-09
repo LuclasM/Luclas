@@ -33,7 +33,7 @@ class TaskRunner:
 
     def __init__(self, llm, schemas, fns, task_store,
                  task_memory: TaskMemory, mem_store, session_id: str,
-                 progress_callback=None):
+                 progress_callback=None, supplement_queue=None):
         self.llm               = llm
         self.schemas           = schemas
         self.fns               = fns
@@ -42,19 +42,22 @@ class TaskRunner:
         self.mem_store         = mem_store
         self.session_id        = session_id
         self.progress_callback = progress_callback
+        self.supplement_queue  = supplement_queue
         # P0-4: 升级触发机制 - 跟踪 root 任务完成情况
         self._upgrade_evaluator = UpgradeEvaluator(self.llm, self.task_memory, self.mem_store)
 
     # ── 入口 ─────────────────────────────────────────────
 
     def run(self, goal: str) -> str:
-        root      = _node(goal)
-        record_id = uuid.uuid4().hex[:12]
-        started   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        mem_id    = [None]   # list 让递归内层可以修改
+        display_goal = _strip_adapter_prefix(goal)   # clean goal for DB / display
+        self.llm.set_goal(display_goal)              # classify without adapter noise
+        root         = _node(goal)                   # full goal (with adapter context) for LLM
+        record_id   = uuid.uuid4().hex[:12]
+        started     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        mem_id      = [None]   # list 让递归内层可以修改
 
-        self._persist(record_id, root, "running", "", [], started)
-        root_task = {"id": record_id, "goal": goal, "status": "active", "log": "", "result": ""}
+        self._persist(record_id, root, "running", "", [], started, display_goal)
+        root_task = {"id": record_id, "goal": display_goal, "status": "active", "log": "", "result": ""}
         self.task_store.save(root_task)
 
         try:
@@ -62,7 +65,7 @@ class TaskRunner:
             self._run_node(root, root, record_id, started, history_ctx, mem_id, depth=0)
         except KeyboardInterrupt:
             self._mark_interrupted(root)
-            self._persist(record_id, root, "active", T.sentinel_user_interrupted(), [], started)
+            self._persist(record_id, root, "active", T.sentinel_user_interrupted(), [], started, display_goal)
             root_task["status"] = "failed"
             root_task["result"] = T.sentinel_user_interrupted()
             self.task_store.save(root_task)
@@ -71,7 +74,7 @@ class TaskRunner:
 
         final = root.get("result", T.sentinel_not_completed())
         summary, artifacts = self._post_process(goal, final)
-        self._persist(record_id, root, "active", summary, artifacts, started)
+        self._persist(record_id, root, "active", summary, artifacts, started, display_goal)
         root_task["status"] = "done"
         root_task["result"] = final[:500]
         self.task_store.save(root_task)
@@ -232,6 +235,7 @@ class TaskRunner:
                 task_context=full_ctx,
                 parent_goal=immediate_parent,
                 progress_callback=self.progress_callback,
+                supplement_queue=self.supplement_queue,
             )
             task["result"] = result
             task["status"] = "done"
@@ -309,12 +313,13 @@ class TaskRunner:
     # ── 持久化 ───────────────────────────────────────────
 
     def _persist(self, record_id: str, root: dict, tier: str,
-                 summary: str, artifacts: list, created_at: str) -> None:
+                 summary: str, artifacts: list, created_at: str,
+                 display_goal: str | None = None) -> None:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.task_memory.save({
             "id":           record_id,
             "session_id":   self.session_id,
-            "goal":         root["goal"],
+            "goal":         display_goal or root["goal"],
             "summary":      summary,
             "artifacts":    artifacts,
             "tree":         root,
@@ -422,6 +427,11 @@ class TaskRunner:
 
 def _is_failed(result: str) -> bool:
     return any(result.startswith(p) for p in T.failed_prefixes())
+
+
+def _strip_adapter_prefix(goal: str) -> str:
+    """Remove messaging-adapter context prefixes injected before the actual task goal."""
+    return re.sub(r'^\[[^\]]{0,200}\]\s*', '', goal).strip()
 
 
 def _goals_similar(a: str, b: str) -> bool:

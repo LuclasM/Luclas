@@ -21,7 +21,7 @@ _ANSI_RE = None
 def run_agent(goal: str, task: dict, llm: LLMClient,
               schemas: list, fns: dict,
               task_context: str = "", parent_goal: str = "",
-              progress_callback=None) -> str:
+              progress_callback=None, supplement_queue=None) -> str:
     """
     执行一个目标，返回最终回答。
     task: dict with id, goal, log (mutated in-place)
@@ -41,6 +41,10 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
     _log(task, f"\n=== Goal: {goal} ===")
 
     for iteration in range(1, AGENT_MAX_ITERATIONS + 1):
+        # Inject any pending supplement messages from the user
+        if supplement_queue is not None:
+            _drain_supplements(supplement_queue, messages, task)
+
         print(T.round_header(iteration, AGENT_MAX_ITERATIONS))
         if iteration == 1:
             if parent_goal and parent_goal != goal:
@@ -55,6 +59,12 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
             _handle_pause(task, goal, messages)  # 二次 Ctrl-C 时内部 raise
             continue
         except RuntimeError as e:
+            err_str = str(e)
+            # Escalate on rate-limit, server error, or connection failure
+            if any(sig in err_str for sig in ("429", "502", "503", "Could not connect", "timed out")):
+                if llm.escalate():
+                    _log(task, f"LLM error, escalated to next model: {err_str[:120]}")
+                    continue
             print(f"  {err('✗')} {T.llm_call_failed(e)}")
             _log(task, T.llm_call_failed(e))
             break
@@ -114,6 +124,20 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
             args_hash = hashlib.md5(fn_args.encode()).hexdigest()
             call_history.append((fn_name, args_hash))
             if _is_stalled(call_history):
+                if llm.escalate():
+                    call_history.clear()
+                    consecutive_errors = 0
+                    _log(task, f"  {fn_name}({fn_args[:200]}) → {result[:300]}")
+                    # Complete pending tool results before injecting the system note,
+                    # otherwise the API rejects the next call (tool_call_id mismatch).
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
+                    for rtc in tool_calls[i + 1:]:
+                        messages.append({"role": "tool", "tool_call_id": rtc["id"],
+                                         "content": "[escalating — skipped]"})
+                    messages.append({"role": "user", "content": "[系统：检测到循环，已切换模型，请换一种方式继续]"})
+                    _log(task, "Stall detected — escalated to next model")
+                    tool_interrupted = True
+                    break
                 reason = T.stalled_loop(AGENT_STALL_WINDOW)
                 print(f"  {warn('⚠')} {reason}")
                 _log(task, f"⚠ {reason}")
@@ -126,13 +150,24 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
                 consecutive_errors = 0
 
             if consecutive_errors >= AGENT_MAX_ERRORS:
+                if llm.escalate():
+                    call_history.clear()
+                    consecutive_errors = 0
+                    _log(task, f"  {fn_name}({fn_args[:200]}) → {result[:300]}")
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
+                    for rtc in tool_calls[i + 1:]:
+                        messages.append({"role": "tool", "tool_call_id": rtc["id"],
+                                         "content": "[escalating — skipped]"})
+                    messages.append({"role": "user", "content": "[系统：连续错误，已切换模型，请继续]"})
+                    _log(task, "Too many errors — escalated to next model")
+                    tool_interrupted = True
+                    break
                 reason = T.too_many_errors(AGENT_MAX_ERRORS)
                 print(f"  {warn('⚠')} {reason}")
                 _log(task, f"⚠ {reason}")
                 _save_messages(task["id"], messages)
                 return T.sentinel_interrupted(reason)
 
-            icon = ok("✓") if not is_error else err("✗")
             _log(task, f"  {fn_name}({fn_args[:200]}) → {result[:300]}")
 
             messages.append({
@@ -339,3 +374,16 @@ def _save_messages(task_id: str, messages: list) -> None:
 def _strip_ansi(text: str) -> str:
     import re
     return re.sub(r'\x1b\[[0-9;]*m', '', text)
+
+
+def _drain_supplements(q, messages: list, task: dict) -> None:
+    """Pull any pending supplement messages and inject them as user turns."""
+    import queue as _queue
+    while True:
+        try:
+            msg = q.get_nowait()
+            note = f"[用户补充信息] {msg}"
+            messages.append({"role": "user", "content": note})
+            _log(task, f"Supplement injected: {msg[:120]}")
+        except _queue.Empty:
+            break

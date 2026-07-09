@@ -1,4 +1,4 @@
-__version__ = "0.1.0"
+__version__ = "0.1.13"
 
 import builtins
 import datetime
@@ -9,10 +9,19 @@ import readline
 import sys
 import uuid
 
-from config import (BASE_DIR, DB_PATH, DATA_DIR, CORE_PATH, CORE_LOCAL_PATH, CORE_HIST, REFLECT_PATH,
-                    RAW_DIR, SESSION_DIR, LLM_BASE_URL, LLM_MODEL, AGENT_MAX_ITERATIONS,
-                    VERSION, VERSION_DATE)
+from config import (CODE_DIR, BASE_DIR, DB_PATH, DATA_DIR, CORE_PATH, CORE_LOCAL_PATH, CORE_HIST, REFLECT_PATH,
+                    RAW_DIR, SESSION_DIR, LLM_BASE_URL, LLM_MODEL, MODELS_CONFIG_PATH,
+                    AGENT_MAX_ITERATIONS, VERSION, VERSION_DATE)
 from llm_client import LLMClient
+from llm_router import ModelRouter, load_models
+
+
+def _make_llm() -> LLMClient:
+    models = load_models(MODELS_CONFIG_PATH)
+    router = ModelRouter(models) if models else None
+    if router:
+        print(f"[router] loaded {len(models)} model(s)")
+    return LLMClient(router=router)
 from memory.database import init_db
 from memory.store import MemoryStore, TaskStore
 from memory.task_memory import TaskMemory
@@ -72,7 +81,7 @@ def _run_headless(goal: str) -> None:
     _cleanup_interrupted_state()
 
     session_id  = uuid.uuid4().hex[:8]
-    llm         = LLMClient()
+    llm         = _make_llm()
     store       = MemoryStore()
     task_store  = TaskStore()
     task_memory = TaskMemory()
@@ -107,7 +116,7 @@ def main():
     _ensure_cron()
 
     session_id  = uuid.uuid4().hex[:8]
-    llm         = LLMClient()
+    llm         = _make_llm()
     store       = MemoryStore()
     task_store  = TaskStore()
     task_memory = TaskMemory()
@@ -124,7 +133,7 @@ def main():
         print(warn(T.core_missing()))
         _bootstrap_core(llm)
 
-    _history_file = os.path.join(SESSION_DIR, ".eva_history")
+    _history_file = os.path.join(SESSION_DIR, ".luclas_history")
     try:
         readline.read_history_file(_history_file)
     except FileNotFoundError:
@@ -153,7 +162,7 @@ def main():
 
     while True:
         try:
-            line = input("EVA > ").strip()
+            line = input("LUC > ").strip()
         except (EOFError, KeyboardInterrupt):
             readline.write_history_file(_history_file)
             print(T.goodbye_nl())
@@ -250,6 +259,9 @@ def _handle_slash(line: str, llm, store, task_store, task_memory, schemas, fns, 
         else:
             _reflect_cmd(runner)
 
+    elif cmd == "models":
+        _show_models(llm)
+
     elif cmd == "schedule":
         _schedule_cmd(sub, rest)
 
@@ -281,6 +293,35 @@ def _show_whoami(llm: LLMClient, store: MemoryStore):
     avail = ok(T.online()) if llm.is_available() else err(T.offline())
     print(T.whoami_llm_status(avail))
     print(T.whoami_time(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    print()
+
+
+def _show_models(llm: LLMClient):
+    from llm_router import load_models
+    models = load_models(MODELS_CONFIG_PATH)
+    if not models:
+        # Fallback: show the single env-var model
+        print(f"\n{head(T.models_title(1))}")
+        status = ok(T.online()) if llm.is_available() else err(T.offline())
+        print(f"  [default]  {llm.model}  {status}")
+        print(f"  endpoint:  {llm.base_url}")
+        print()
+        return
+
+    print(f"\n{head(T.models_title(len(models)))}")
+    active_name = llm.model  # currently active default (no goal set yet)
+    for m in models:
+        marker = "◉" if m.classifier else "○"
+        types  = ", ".join(m.task_types) if m.task_types != ["general"] else "general"
+        complexity_label = {"low": "低", "mid": "中", "high": "高"}.get(m.complexity, m.complexity)
+        print(
+            f"  [{marker}] {m.id:<18} {m.name:<32}"
+            f"  complexity={m.complexity}({complexity_label})"
+            f"  priority={m.priority}"
+        )
+        print(f"       {dim(m.base_url)}  types: {types}")
+        if m.classifier:
+            print(f"       {dim('(used as classifier for task classification)')}")
     print()
 
 
@@ -441,7 +482,7 @@ def _do_reset(store: MemoryStore, task_store: TaskStore, task_memory: TaskMemory
     conn = sqlite3.connect(DB_PATH)
     conn.execute("VACUUM")
     conn.close()
-    history = os.path.join(SESSION_DIR, ".eva_history")
+    history = os.path.join(SESSION_DIR, ".luclas_history")
     if os.path.isfile(history):
         os.unlink(history)
     print(ok(T.reset_done()))
@@ -651,7 +692,7 @@ def _migrate_embeddings() -> None:
 def _ensure_cron() -> None:
     """确保 cron_runner.py 已注册到 crontab，没有则自动添加。"""
     import subprocess
-    cron_entry = f"* * * * * /usr/bin/python3 {BASE_DIR}/cron_runner.py >> {DATA_DIR}/sessions/logs/cron.log 2>&1"
+    cron_entry = f"* * * * * /usr/bin/python3 {CODE_DIR}/cron_runner.py >> {DATA_DIR}/sessions/logs/cron.log 2>&1"
     try:
         existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
     except subprocess.CalledProcessError:

@@ -52,6 +52,8 @@ def _get_access_token() -> str:
             params={"corpid": CORP_ID, "corpsecret": SECRET},
             timeout=10,
         ).json()
+        if "access_token" not in r:
+            raise RuntimeError(f"WeChat token error: {r.get('errmsg', r)}")
         _token_cache["token"]      = r["access_token"]
         _token_cache["expires_at"] = time.time() + r["expires_in"]
         return _token_cache["token"]
@@ -87,6 +89,8 @@ def _verify_signature(signature: str, timestamp: str, nonce: str, echostr_or_enc
 # ---------------------------------------------------------------------------
 
 def _send_text(user_id: str, content: str) -> None:
+    if not CORP_ID or not SECRET or not AGENT_ID:
+        return
     token = _get_access_token()
     requests.post(
         "https://qyapi.weixin.qq.com/cgi-bin/message/send",
@@ -120,38 +124,18 @@ def _run_command_and_reply(user_id: str, line: str) -> None:
 
 
 def _process_and_reply(user_id: str, message: str) -> None:
+    # Submit task and return — the task thread pushes the final result directly
+    # via progress_callback/completion path in api.py, so no polling needed here.
     headers = {"X-API-Key": LUC_API_KEY, "Content-Type": "application/json"}
     try:
-        r = requests.post(
+        requests.post(
             f"{LUC_API_BASE}/chat",
             json={"message": message, "session_id": f"wecom_{user_id}"},
             headers=headers,
             timeout=10,
-        ).json()
-        task_id = r["task_id"]
+        )
     except Exception as e:
         _send_text(user_id, f"❌ 提交任务失败：{e}")
-        return
-
-    # 轮询结果，最多等 5 分钟
-    for _ in range(150):
-        time.sleep(2)
-        try:
-            res = requests.get(
-                f"{LUC_API_BASE}/result/{task_id}",
-                headers=headers,
-                timeout=10,
-            ).json()
-        except Exception:
-            continue
-        if res["status"] == "done":
-            _send_text(user_id, res["result"] or "✅ 完成")
-            return
-        if res["status"] == "failed":
-            _send_text(user_id, f"❌ 任务失败：{res.get('result','')}")
-            return
-
-    _send_text(user_id, "⏱ 任务超时，请稍后用 /status 查询")
 
 
 # ---------------------------------------------------------------------------

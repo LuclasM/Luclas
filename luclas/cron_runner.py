@@ -273,7 +273,7 @@ def _launch(extra_args: list[str], log_suffix: str) -> None:
         subprocess.Popen(
             [sys.executable, _LUCLAS_PY] + extra_args,
             stdout=lf, stderr=lf,
-            cwd=BASE_DIR, start_new_session=True,
+            cwd=CODE_DIR, start_new_session=True,
         )
     _log(f"launched {extra_args} → {log_path}")
 

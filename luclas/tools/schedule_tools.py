@@ -21,7 +21,7 @@ SCHEDULE_ADD_SCHEMA = {
                 },
                 "goal": {
                     "type": "string",
-                    "description": "The instruction EVA will receive when the task fires (be specific)",
+                    "description": "The instruction Luclas will receive when the task fires (be specific)",
                 },
                 "schedule_type": {
                     "type": "string",

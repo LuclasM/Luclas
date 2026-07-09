@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 
 import requests
 from fastapi import APIRouter, Query, Request, Response
@@ -65,37 +64,17 @@ def _run_command_and_reply(phone: str, line: str) -> None:
 
 
 def _process_and_reply(phone: str, message: str) -> None:
+    # Submit task and return — the task thread pushes the final result directly.
     headers = {"X-API-Key": LUC_API_KEY, "Content-Type": "application/json"}
     try:
-        r = requests.post(
+        requests.post(
             f"{LUC_API_BASE}/chat",
             json={"message": message, "session_id": f"whatsapp_{phone}"},
             headers=headers,
             timeout=10,
-        ).json()
-        task_id = r["task_id"]
+        )
     except Exception as e:
         send_text(phone, f"❌ Failed to submit: {e}")
-        return
-
-    for _ in range(150):
-        time.sleep(2)
-        try:
-            res = requests.get(
-                f"{LUC_API_BASE}/result/{task_id}",
-                headers=headers,
-                timeout=10,
-            ).json()
-        except Exception:
-            continue
-        if res["status"] == "done":
-            send_text(phone, res["result"] or "✅ Done")
-            return
-        if res["status"] == "failed":
-            send_text(phone, f"❌ Task failed: {res.get('result', '')}")
-            return
-
-    send_text(phone, "⏱ Task timed out")
 
 
 # ---------------------------------------------------------------------------

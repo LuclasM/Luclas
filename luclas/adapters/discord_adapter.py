@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-import time
 
 import requests
 
@@ -96,40 +95,18 @@ def _run_command_and_reply(user_id: str, line: str, reply_fn) -> None:
 
 
 def _process_and_reply(user_id: str, message: str, reply_fn) -> None:
+    # Submit task and return — the task thread pushes the final result via send_text().
     headers = {"X-API-Key": LUC_API_KEY, "Content-Type": "application/json"}
     try:
-        r = requests.post(
+        requests.post(
             f"{LUC_API_BASE}/chat",
             json={"message": message, "session_id": f"discord_{user_id}"},
             headers=headers,
             timeout=10,
-        ).json()
-        task_id = r["task_id"]
+        )
     except Exception as e:
         if _bot_loop:
             asyncio.run_coroutine_threadsafe(reply_fn(f"❌ Submit failed: {e}"), _bot_loop)
-        return
-
-    result_text = "⏱ Task timed out"
-    for _ in range(150):
-        time.sleep(2)
-        try:
-            res = requests.get(
-                f"{LUC_API_BASE}/result/{task_id}",
-                headers=headers,
-                timeout=10,
-            ).json()
-        except Exception:
-            continue
-        if res["status"] == "done":
-            result_text = res["result"] or "✅ Done"
-            break
-        if res["status"] == "failed":
-            result_text = f"❌ Task failed: {res.get('result', '')}"
-            break
-
-    if _bot_loop:
-        asyncio.run_coroutine_threadsafe(reply_fn(result_text), _bot_loop)
 
 
 # ---------------------------------------------------------------------------

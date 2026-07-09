@@ -6,22 +6,73 @@ from config import LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
 
 class LLMClient:
 
-    def __init__(self, base_url=None, model=None):
-        self.base_url = (base_url or LLM_BASE_URL).rstrip("/")
-        self.model    = model or LLM_MODEL
-        self._headers = {
-            "Authorization": f"Bearer {LLM_API_KEY}",
+    def __init__(self, base_url=None, model=None, router=None):
+        self._default_base_url = (base_url or LLM_BASE_URL).rstrip("/")
+        self._default_model    = model or LLM_MODEL
+        self._default_api_key  = LLM_API_KEY
+        self._router           = router
+        self._model_queue: list = []   # list[ModelConfig] populated by set_goal()
+        self._current_idx: int  = 0
+
+    # ── Routing API ──────────────────────────────────────────────────────────
+
+    def set_goal(self, goal: str) -> None:
+        """Classify the goal and build the ordered model queue for this task."""
+        if self._router:
+            self._model_queue = self._router.select_models(goal)
+            self._current_idx = 0
+            if self._model_queue:
+                m = self._model_queue[0]
+                print(f"[router] → {m.name}  (queue: {len(self._model_queue)} model(s))")
+        else:
+            self._model_queue = []
+            self._current_idx = 0
+
+    def escalate(self) -> bool:
+        """Switch to the next model in the queue. Returns True if a next model exists."""
+        if self._model_queue and self._current_idx < len(self._model_queue) - 1:
+            self._current_idx += 1
+            m = self._model_queue[self._current_idx]
+            print(f"[router] escalated → {m.name}")
+            return True
+        return False
+
+    # ── Active model properties ──────────────────────────────────────────────
+
+    @property
+    def _active(self):
+        if self._model_queue and self._current_idx < len(self._model_queue):
+            return self._model_queue[self._current_idx]
+        return None
+
+    @property
+    def base_url(self) -> str:
+        return self._active.base_url if self._active else self._default_base_url
+
+    @property
+    def model(self) -> str:
+        return self._active.name if self._active else self._default_model
+
+    @property
+    def _headers(self) -> dict:
+        api_key = self._active.api_key if self._active else self._default_api_key
+        return {
+            "Authorization": f"Bearer {api_key}",
             "Content-Type":  "application/json",
         }
 
-    def chat(self, messages: list, temperature=0.7) -> str:
+    # ── LLM calls ────────────────────────────────────────────────────────────
+
+    def chat(self, messages: list, temperature=0.7, **kwargs) -> str:
         payload = {
-            "model":    self.model,
-            "messages": messages,
-            "stream":   False,
+            "model":       self.model,
+            "messages":    messages,
+            "stream":      False,
             "temperature": temperature,
-            "chat_template_kwargs": {"enable_thinking": False},
         }
+        if "qwen" in self.model.lower():
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload.update(kwargs)
         resp = self._post(payload)
         return resp["choices"][0]["message"]["content"] or ""
 
@@ -44,8 +95,9 @@ class LLMClient:
             "stream":      False,
             "tools":       tools,
             "tool_choice": "auto",
-            "chat_template_kwargs": {"enable_thinking": False},
         }
+        if "qwen" in self.model.lower():
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         resp = self._post(payload)
         msg = resp["choices"][0]["message"]
         return {
@@ -79,8 +131,8 @@ class LLMClient:
             except requests.exceptions.Timeout:
                 last_err = RuntimeError("LLM response timed out")
             except requests.exceptions.HTTPError as e:
-                # HTTP 4xx/5xx 不重试
-                raise RuntimeError(f"LLM request failed: {e.response.status_code} — {e.response.text[:300]}")
+                code = e.response.status_code
+                raise RuntimeError(f"LLM request failed: {code} — {e.response.text[:300]}")
             if attempt < retries - 1:
                 time.sleep(retry_delay)
         raise last_err

@@ -85,7 +85,15 @@ class MemoryStore:
     def update(self, mid: str, content: str = None, type: str = None,
                tags: list = None, importance: int = None) -> bool:
         fields, params = [], []
-        if content   is not None: fields.append("content=?");    params.append(content)
+        if content   is not None:
+            fields.append("content=?")
+            params.append(content)
+            try:
+                from memory.embedder import encode
+                fields.append("embedding=?")
+                params.append(encode(content))
+            except Exception:
+                pass
         if type      is not None: fields.append("type=?");       params.append(type)
         if tags      is not None: fields.append("tags=?");       params.append(json.dumps(tags, ensure_ascii=False))
         if importance is not None: fields.append("importance=?"); params.append(importance)
@@ -108,17 +116,17 @@ class MemoryStore:
         """为没有 embedding 的旧记忆批量计算向量，返回处理条数。"""
         with get_conn() as conn:
             rows = conn.execute(
-                "SELECT id, content FROM memories WHERE embedding IS NULL"
+                "SELECT rowid, content FROM memories WHERE embedding IS NULL"
             ).fetchall()
         if not rows:
             return 0
         from memory.embedder import encode_batch
-        ids = [r["id"] for r in rows]
+        rowids = [r["rowid"] for r in rows]
         embs = encode_batch([r["content"] for r in rows])
         with get_conn() as conn:
-            for mid, emb in zip(ids, embs):
-                conn.execute("UPDATE memories SET embedding=? WHERE id=?", (emb, mid))
-        return len(ids)
+            for rowid, emb in zip(rowids, embs):
+                conn.execute("UPDATE memories SET embedding=? WHERE rowid=?", (emb, rowid))
+        return len(rowids)
 
     def count(self) -> int:
         with get_conn() as conn:

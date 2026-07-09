@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import queue
 import sys
 import threading
 import uuid
@@ -23,8 +24,9 @@ sys.path.insert(0, BASE_DIR)
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from config import CORE_HIST, DATA_DIR, LLM_BASE_URL, LLM_MODEL, RAW_DIR, SESSION_DIR
+from config import CORE_HIST, DATA_DIR, LLM_BASE_URL, LLM_MODEL, MODELS_CONFIG_PATH, RAW_DIR, SESSION_DIR
 from llm_client import LLMClient
+from llm_router import ModelRouter, load_models
 from memory.database import init_db
 from memory.store import MemoryStore, TaskStore
 from memory.task_memory import TaskMemory
@@ -57,6 +59,12 @@ _task_memory: TaskMemory  | None = None
 _results: dict[str, dict] = {}
 _lock = threading.Lock()
 
+# Per-session supplement queues and running task tracking
+# session_id → queue of pending supplement messages
+_session_queues: dict[str, queue.Queue] = {}
+# session_id → task_id of the currently-running task
+_session_tasks: dict[str, str] = {}
+
 
 @app.on_event("startup")
 def _startup() -> None:
@@ -67,7 +75,12 @@ def _startup() -> None:
               CORE_HIST]:
         os.makedirs(d, exist_ok=True)
     init_db()
-    _llm         = LLMClient()
+    _router = None
+    _loaded = load_models(MODELS_CONFIG_PATH)
+    if _loaded:
+        _router = ModelRouter(_loaded)
+        print(f"[router] loaded {len(_loaded)} model(s) from models.json")
+    _llm         = LLMClient(router=_router)
     _store       = MemoryStore()
     _task_store  = TaskStore()
     _task_memory = TaskMemory()
@@ -110,38 +123,80 @@ class ResultResponse(BaseModel):
 # Background worker
 # ---------------------------------------------------------------------------
 
-def _make_wecom_callback(user_id: str):
-    from adapters.wecom import _send_text
-    def _cb(msg: str):
-        try:
-            _send_text(user_id, msg)
-        except Exception:
-            pass
-    return _cb
+def _make_push_callback(session_id: str):
+    """Return a send-function for the adapter that owns this session, or None."""
+    if session_id.startswith("wecom_"):
+        user_id = session_id[len("wecom_"):]
+        from adapters.wecom import _send_text
+        def _cb(msg: str):
+            try:
+                _send_text(user_id, msg)
+            except Exception:
+                pass
+        return _cb
+
+    if session_id.startswith("whatsapp_"):
+        phone = session_id[len("whatsapp_"):]
+        from adapters.whatsapp import send_text as _wa_send
+        def _cb(msg: str):
+            try:
+                _wa_send(phone, msg)
+            except Exception:
+                pass
+        return _cb
+
+    if session_id.startswith("discord_"):
+        from adapters.discord_adapter import send_text as _dc_send
+        def _cb(msg: str):
+            try:
+                for i in range(0, max(len(msg), 1), 1900):
+                    _dc_send(msg[i:i + 1900])
+            except Exception:
+                pass
+        return _cb
+
+    return None
 
 
-def _run_task(task_id: str, goal: str, session_id: str) -> None:
+def _run_task(task_id: str, goal: str, session_id: str,
+              supplement_queue: "queue.Queue | None" = None) -> None:
     from tools.user_input import _NeedUserInput
     schemas, fns = build_tools(_store)
 
-    progress_callback = None
-    if session_id.startswith("wecom_"):
-        user_id = session_id[len("wecom_"):]
-        progress_callback = _make_wecom_callback(user_id)
+    push = _make_push_callback(session_id)
+    progress_callback = push  # same channel for progress and completion
+
+    # Per-task LLM client so concurrent sessions don't share _model_queue / _current_idx.
+    # The ModelRouter itself is stateless and safe to share.
+    task_llm = LLMClient(router=_llm._router if _llm else None)
 
     runner = TaskRunner(
-        llm=_llm, schemas=schemas, fns=fns,
+        llm=task_llm, schemas=schemas, fns=fns,
         task_store=_task_store, task_memory=_task_memory,
         mem_store=_store, session_id=session_id,
         progress_callback=progress_callback,
+        supplement_queue=supplement_queue,
     )
     try:
         result = runner.run(goal)
         _set_result(task_id, "done", result)
+        if push:
+            push(result or "✅ 完成")
     except _NeedUserInput as e:
-        _set_result(task_id, "done", f"❓ {e.question}")
+        msg = f"❓ {e.question}"
+        _set_result(task_id, "done", msg)
+        if push:
+            push(msg)
     except Exception as e:
-        _set_result(task_id, "failed", str(e))
+        msg = str(e)
+        _set_result(task_id, "failed", msg)
+        if push:
+            push(f"❌ 任务失败：{msg[:500]}")
+    finally:
+        with _lock:
+            if _session_tasks.get(session_id) == task_id:
+                _session_tasks.pop(session_id, None)
+                _session_queues.pop(session_id, None)
 
 
 def _set_result(task_id: str, status: str, result: str) -> None:
@@ -150,6 +205,19 @@ def _set_result(task_id: str, status: str, result: str) -> None:
             _results[task_id]["status"]      = status
             _results[task_id]["result"]      = result
             _results[task_id]["finished_at"] = _now()
+        _purge_old_results()
+
+
+def _purge_old_results() -> None:
+    """Remove finished results older than 2 hours. Must be called under _lock."""
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=2)
+    cutoff_str = cutoff.isoformat(timespec="seconds")
+    stale = [
+        tid for tid, v in _results.items()
+        if v["status"] != "running" and v.get("finished_at", "") < cutoff_str
+    ]
+    for tid in stale:
+        _results.pop(tid, None)
 
 
 def _now() -> str:
@@ -208,8 +276,8 @@ def status():
     pending   = sum(1 for v in _results.values() if v["status"] == "running")
     return {
         "llm":          "online" if llm_ok else "offline",
-        "model":        LLM_MODEL,
-        "endpoint":     LLM_BASE_URL,
+        "model":        _llm.model    if _llm else LLM_MODEL,
+        "endpoint":     _llm.base_url if _llm else LLM_BASE_URL,
         "memory_count": mem_count,
         "pending":      pending,
     }
@@ -220,21 +288,34 @@ def chat(req: ChatRequest):
     """
     Submit a task. Returns immediately with a task_id.
     Poll GET /result/{task_id} for the outcome.
+    If the same session already has a running task, the message is injected
+    into that task as a supplement instead of starting a new one.
     """
-    task_id    = uuid.uuid4().hex[:12]
     session_id = req.session_id or uuid.uuid4().hex[:8]
 
     with _lock:
+        running_task_id = _session_tasks.get(session_id)
+        if running_task_id and _results.get(running_task_id, {}).get("status") == "running":
+            # Inject into the running task instead of starting a new one
+            q = _session_queues.get(session_id)
+            if q is not None:
+                q.put(req.message)
+            return {"task_id": running_task_id, "status": "running"}
+
+        task_id = uuid.uuid4().hex[:12]
+        q = queue.Queue()
         _results[task_id] = {
             "status":      "running",
             "result":      "",
             "started_at":  _now(),
             "finished_at": "",
         }
+        _session_queues[session_id] = q
+        _session_tasks[session_id]  = task_id
 
     t = threading.Thread(
         target=_run_task,
-        args=(task_id, req.message, session_id),
+        args=(task_id, req.message, session_id, q),
         daemon=True,
     )
     t.start()
