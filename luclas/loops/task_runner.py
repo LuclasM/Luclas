@@ -74,6 +74,7 @@ class TaskRunner:
 
         final = root.get("result", T.sentinel_not_completed())
         summary, artifacts = self._post_process(goal, final)
+        self._collect_feedback(display_goal, summary)
         self._persist(record_id, root, "active", summary, artifacts, started, display_goal)
         root_task["status"] = "done"
         root_task["result"] = final[:500]
@@ -366,6 +367,27 @@ class TaskRunner:
         except Exception:
             pass
         return result[:80], []
+
+    def _collect_feedback(self, goal: str, summary: str) -> str:
+        """Ask the user for feedback on the completed task; saved to memory for future learning.
+        Only runs interactively — in non-interactive channels (API/adapters) ask_user raises
+        _NeedUserInput, which we treat as "no feedback loop available here" and skip.
+        """
+        from tools.user_input import ask_user, _NeedUserInput
+        try:
+            answer = ask_user(T.feedback_question(summary))
+        except _NeedUserInput:
+            return ""
+        if not answer or answer == T.ask_user_no_answer():
+            return ""
+        self.mem_store.write(
+            content=f"Task: {goal}\nSummary: {summary}\nUser feedback: {answer}",
+            type="feedback",
+            tags=["user_feedback", goal[:20]],
+            importance=7,
+        )
+        print(dim(T.feedback_saved()))
+        return answer
 
     # ── 树显示 ───────────────────────────────────────────
 
