@@ -25,7 +25,7 @@ class TaskMemory:
 
     def save(self, record: dict) -> None:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        tree = record.get("tree", {})
+        tree = record.get("tree") or {}
         status = record.get("status") or tree.get("status") or "running"
         if status not in ("done", "failed"):
             status = "running"
