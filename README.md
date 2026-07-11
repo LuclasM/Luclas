@@ -1,5 +1,7 @@
 # Luclas `v0.1.0`
 
+See [CHANGELOG.md](CHANGELOG.md) for what's changed since this tag.
+
 Luclas is a self-evolving AI agent. It starts empty and grows through use.
 
 Most AI assistants are static — same behavior on day one as day one thousand. Luclas is different: every task it runs, every mistake it makes, every correction you give it gets written into a persistent memory and a self-managed policy file (`core.md`). The agent reads its own history before acting, and can rewrite its own operating rules mid-task when it finds a better way.
@@ -40,10 +42,13 @@ Luclas grows faster with real work than with test questions.
 ## Features
 
 - **Recursive task decomposition** — the LLM decides whether a goal needs subtasks, with no fixed depth limit.
-- **Long-term memory** — searchable SQLite store with tags, importance scores, and semantic search (sentence-transformers + cosine similarity, keyword fallback).
+- **Long-term memory** — searchable SQLite store with tags, importance scores, semantic search (sentence-transformers + cosine similarity, keyword fallback), and per-entry **source/credibility** tracking (first-hand experience, user instruction, learning material, web, etc. — 1-10 confidence score) so retrieval can tell a verified fact from a guess.
 - **Episodic memory** — recent tasks injected into context; older ones archived; very old batches compressed into LLM-written summaries.
+- **Multi-model routing** — configure several local/hosted models in `data/models.json` (`/models edit` for an interactive TUI manager) and Luclas classifies each task's complexity/type to route it to the right one, escalating to a stronger model on failure. Works with a single model too — this is entirely optional.
+- **Local LLM auto-detection** — setup scans for a running Ollama, LM Studio, or vLLM server on common local ports and offers it as a ready-to-use option, instead of requiring you to already know the base URL/port.
+- **Feedback loop** — after a task that's non-routine (first time doing something, mid-task errors, long-running, large/multi-step, or an open-ended result), Luclas asks how it went, saves the exchange as a memory, and — if you give it a corrected approach and confirm — redoes the task differently. Skipped automatically for simple, routine tasks.
 - **Tool use** — shell, Python (subprocess-isolated), file ops, grep/find, HTTP, web search/fetch, memory read/write, scheduled tasks.
-- **Messaging adapters** — receive tasks and push results via WeCom (企业微信); more platforms coming.
+- **Messaging adapters** — WeCom (企业微信), WhatsApp, and Discord, all sharing one dispatch layer (command/task routing, reply language via `LUC_LANG`) so behavior is consistent across channels; more platforms coming.
 - **HTTP API** — submit tasks asynchronously, poll for results, integrate with external systems.
 - **Scheduled tasks** — daily/weekly/one-shot tasks set via natural language; results routed back to the channel that created them.
 - **i18n** — CLI display language via `LUC_LANG` (`en` default, `zh` supported).
@@ -67,7 +72,10 @@ On first run Luclas generates its own `data/core.md` by asking the LLM to write 
 | `LUC_LLM_MODEL` | `qwen3.6-27b-awq-int4` | Model name |
 | `LUC_LLM_API_KEY` | `none` | API key if required |
 | `LUC_API_KEY` | _(none)_ | Auth key for the HTTP API |
+| `LUC_API_PORT` | `8080` | HTTP API listen port |
 | `LUC_EMBED_MODEL` | language-dependent | sentence-transformers model for memory search |
+
+For more than one model, skip `LUC_LLM_*` and configure `data/models.json` instead (`luclas` → `/models edit` for an interactive editor) — Luclas will route each task to the right model automatically.
 
 ### Private policy customization
 
@@ -85,15 +93,19 @@ luclas/
   config.py            env-driven configuration
   i18n.py              CLI display strings
   llm_client.py        OpenAI-compatible chat client
+  llm_router.py        multi-model routing (classify task → pick a model)
+  model_manager.py     interactive TUI for data/models.json
+  local_llm_detect.py  auto-detect a running Ollama/LM Studio/vLLM server
   loops/
     agent_loop.py      core LLM ↔ tool execution loop
-    task_runner.py     recursive decompose/execute/merge
+    task_runner.py     recursive decompose/execute/merge, feedback loop
   memory/
     database.py        SQLite schema and migrations
-    store.py           long-term memory
+    store.py           long-term memory (source/credibility, semantic search)
     task_memory.py     episodic task history
   tools/               shell/python/file/search/http/web/memory/schedule tools
   adapters/
+    dispatch.py        shared command/task routing used by all three below
     wecom.py           WeCom (企业微信) adapter
     whatsapp.py        WhatsApp Business Cloud API adapter
     discord_adapter.py Discord bot adapter

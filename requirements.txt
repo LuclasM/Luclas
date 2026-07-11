@@ -2,3 +2,12 @@ requests
 numpy
 sentence-transformers
 ddgs
+
+# HTTP API server (api.py) + adapters/wecom.py, whatsapp.py, discord_adapter.py
+fastapi
+uvicorn
+pydantic
+pycryptodome   # AES en/decryption for the WeCom adapter
+
+# Optional: only needed if you enable the Discord messaging adapter
+# discord.py
