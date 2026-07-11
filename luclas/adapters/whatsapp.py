@@ -15,7 +15,6 @@ import hmac
 import json
 import os
 
-import requests
 from fastapi import APIRouter, Query, Request, Response
 
 from adapters import dispatch
@@ -36,17 +35,20 @@ def send_text(phone: str, content: str) -> None:
     """Send a text message to a WhatsApp number."""
     if not PHONE_NUMBER_ID or not ACCESS_TOKEN:
         return
-    requests.post(
-        _GRAPH_URL.format(phone_number_id=PHONE_NUMBER_ID),
-        headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-        json={
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "type": "text",
-            "text": {"body": content},
-        },
-        timeout=10,
-    )
+    try:
+        dispatch.post_with_retry(
+            _GRAPH_URL.format(phone_number_id=PHONE_NUMBER_ID),
+            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": phone,
+                "type": "text",
+                "text": {"body": content},
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[whatsapp] failed to deliver message to {phone} after retries: {e}")
 
 
 def _verify_signature(raw_body: bytes, signature_header: str) -> bool:

@@ -91,17 +91,20 @@ def _send_text(user_id: str, content: str) -> None:
     if not CORP_ID or not SECRET or not AGENT_ID:
         return
     token = _get_access_token()
-    requests.post(
-        "https://qyapi.weixin.qq.com/cgi-bin/message/send",
-        params={"access_token": token},
-        json={
-            "touser":  user_id,
-            "msgtype": "text",
-            "agentid": int(AGENT_ID),
-            "text":    {"content": content},
-        },
-        timeout=10,
-    )
+    try:
+        dispatch.post_with_retry(
+            "https://qyapi.weixin.qq.com/cgi-bin/message/send",
+            params={"access_token": token},
+            json={
+                "touser":  user_id,
+                "msgtype": "text",
+                "agentid": int(AGENT_ID),
+                "text":    {"content": content},
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[wecom] failed to deliver message to {user_id} after retries: {e}")
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import Callable
 
 import requests
@@ -23,6 +24,29 @@ import i18n as T
 LUC_API_BASE = os.environ.get("LUC_API_BASE", "http://localhost:8080")
 LUC_API_KEY  = os.environ.get("LUC_API_KEY", "")
 
+_RETRY_ATTEMPTS    = 3
+_RETRY_BASE_DELAY  = 1.0   # seconds; doubles each attempt (1s, 2s)
+
+
+def post_with_retry(url: str, max_retries: int = _RETRY_ATTEMPTS,
+                     base_delay: float = _RETRY_BASE_DELAY, **kwargs) -> requests.Response:
+    """requests.post with exponential-backoff retry on transient failures
+    (connection errors, timeouts, 429, 5xx). Fails fast on 4xx (other than
+    429) since retrying a bad request/auth error never helps.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, **kwargs)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise requests.HTTPError(f"transient status {resp.status_code}", response=resp)
+            return resp
+        except (requests.RequestException,) as e:
+            last_exc = e
+            if attempt < max_retries - 1:
+                time.sleep(base_delay * (2 ** attempt))
+    raise last_exc
+
 
 def _headers() -> dict:
     return {"X-API-Key": LUC_API_KEY, "Content-Type": "application/json"}
@@ -30,7 +54,7 @@ def _headers() -> dict:
 
 def _run_command_and_reply(send: Callable[[str], None], line: str) -> None:
     try:
-        r = requests.post(
+        r = post_with_retry(
             f"{LUC_API_BASE}/command",
             json={"line": line},
             headers=_headers(),
@@ -45,7 +69,7 @@ def _submit_task(send: Callable[[str], None], session_id: str, contexted_goal: s
     # Submit and return — the background task thread pushes the final result
     # (and any ask_user question) directly via send(), so no polling here.
     try:
-        requests.post(
+        post_with_retry(
             f"{LUC_API_BASE}/chat",
             json={"message": contexted_goal, "session_id": session_id},
             headers=_headers(),

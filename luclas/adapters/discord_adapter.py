@@ -23,8 +23,6 @@ import threading
 import time
 from typing import Callable
 
-import requests
-
 from adapters import dispatch
 
 BOT_TOKEN  = os.environ.get("DISCORD_BOT_TOKEN", "")
@@ -50,16 +48,19 @@ def send_text(content: str, channel_id: int | None = None) -> None:
     if not cid or not BOT_TOKEN:
         return
     if _bot_loop and _bot_channel:
-        # prefer the live bot connection
+        # prefer the live bot connection (discord.py handles its own rate-limit retries)
         asyncio.run_coroutine_threadsafe(_bot_channel.send(content), _bot_loop)
     else:
         # fallback: REST call (works even if bot loop isn't running)
-        requests.post(
-            f"{_DISCORD_API}/channels/{cid}/messages",
-            headers={"Authorization": f"Bot {BOT_TOKEN}"},
-            json={"content": content},
-            timeout=10,
-        )
+        try:
+            dispatch.post_with_retry(
+                f"{_DISCORD_API}/channels/{cid}/messages",
+                headers={"Authorization": f"Bot {BOT_TOKEN}"},
+                json={"content": content},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"[discord] failed to deliver message to channel {cid} after retries: {e}")
 
 
 def send_dm(user_id: str, content: str) -> None:
@@ -67,21 +68,21 @@ def send_dm(user_id: str, content: str) -> None:
     if not BOT_TOKEN:
         return
     try:
-        r = requests.post(
+        r = dispatch.post_with_retry(
             f"{_DISCORD_API}/users/@me/channels",
             headers={"Authorization": f"Bot {BOT_TOKEN}"},
             json={"recipient_id": user_id},
             timeout=10,
         ).json()
         dm_channel_id = r["id"]
-        requests.post(
+        dispatch.post_with_retry(
             f"{_DISCORD_API}/channels/{dm_channel_id}/messages",
             headers={"Authorization": f"Bot {BOT_TOKEN}"},
             json={"content": content},
             timeout=10,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[discord] failed to send DM to {user_id} after retries: {e}")
 
 
 def _make_channel_send(channel) -> Callable[[str], None]:
