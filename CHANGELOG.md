@@ -3,6 +3,40 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.1] - 2026-07-13
+
+### Added
+- **CI** (`.github/workflows/ci.yml`) — every push/PR now runs a syntax
+  check, a real import check against installed dependencies (would have
+  caught the missing fastapi/pydantic/pycryptodome deps from 0.2.0), and
+  a minimal lint pass restricted to actual errors, not style nitpicks.
+- **CONTRIBUTING.md** — dev setup, what CI checks, PR expectations.
+- **First-run setup** — running `luclas` with no `.env` present now
+  launches the setup wizard automatically instead of starting cold.
+
+### Fixed
+- `is_available()`'s LLM health check used a 5s timeout, too tight for
+  LAN/remote deployments — chat completions succeed over the same path
+  with a 300s timeout, so the startup check would falsely report
+  "offline" on a slightly slower connection. Bumped to 15s.
+- Subtask execution context (task tree, prior-step results) was being
+  injected into the system message, with only the bare goal in the user
+  turn — models respond more literally to the user turn, so this content
+  was easy to ignore. Diagnosed from a real failed task where subtasks
+  repeatedly re-fetched data already gathered by a prior step until
+  manually interrupted. Moved this content into the user message instead,
+  and reworded the reuse instruction to cover actual facts, not just
+  technical artifacts (paths/cookies/IDs).
+- Feedback now folds into the AAR experience memory a task actually
+  wrote (content appended, credibility bumped to reflect human review)
+  instead of always filing a disconnected standalone record.
+- Two f-strings in `task_runner.py` used backslash escapes inside `{}`
+  expressions — legal since Python 3.12 (PEP 701) but a SyntaxError on
+  3.11.
+- The version shown at startup and the `__version__` bumped by the
+  pre-commit hook had drifted apart, showing different numbers for no
+  reason. Startup now reads `__version__` directly.
+
 ## [0.2.0] - 2026-07-11
 
 ### Added
