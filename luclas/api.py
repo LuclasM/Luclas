@@ -16,6 +16,7 @@ import os
 import queue
 import sys
 import threading
+import traceback
 import uuid
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -192,6 +193,8 @@ def _run_task(task_id: str, goal: str, session_id: str,
             push(msg)
     except Exception as e:
         msg = str(e)
+        print(f"[task {task_id}] failed: {msg}", file=sys.stderr)
+        traceback.print_exc()
         _set_result(task_id, "failed", msg)
         if push:
             push(T.channel_task_failed(msg[:500]))
@@ -264,6 +267,7 @@ def run_command(req: CommandRequest):
     except SystemExit:
         pass
     except Exception as e:
+        traceback.print_exc()
         return {"output": f"❌ {e}"}
     # Strip ANSI colour codes
     import re
