@@ -3,6 +3,25 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- **Task execution model**: replaced upfront recursive decomposition (plan
+  the full subtask tree before executing any of it, then run each subtask
+  in its own disconnected conversation) with a single continuous main
+  thread plus on-demand branching. A task is now one `run_agent` conversation
+  from start to finish; the LLM calls a new `delegate_subtask` tool only when
+  a chunk of work is genuinely independent enough to warrant its own
+  sub-conversation, and only the branch's final result folds back in — not
+  its raw tool-call transcript. Decisions about what (if anything) to branch
+  are now made from what has actually happened so far, instead of a static
+  plan drawn up before any of it ran, which is what let later steps overlap
+  with or leave gaps around earlier ones. Branches can run in parallel (the
+  LLM can call `delegate_subtask` more than once per turn) and can
+  themselves branch further, with a soft 3-level nesting cap past which the
+  LLM has to justify going deeper. `task_records.tree`'s on-disk shape is
+  unchanged, so existing history/`/log` data reads exactly as before.
+
 ## [0.2.1] - 2026-07-13
 
 ### Added

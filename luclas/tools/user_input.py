@@ -47,6 +47,17 @@ ASK_USER_SCHEMA = {
 # concurrent sessions without threading extra params through execute_tool.
 _channel_ctx = threading.local()
 
+# delegate_subtask branches run on their own worker threads (see
+# loops/agent_loop.py), which don't inherit threading.local() state from the
+# thread that spawned them — set_channel_context() must be re-applied inside
+# each branch thread using get_channel_context() read from the caller first.
+#
+# Also guards the ask_user() body process-wide: if two branches ask_user()
+# concurrently over the same channel/terminal, the user's one reply can only
+# resolve one of two waiting wait_queue.get() calls (or two tty prompts would
+# interleave), so at most one ask_user() may be in flight at a time.
+_ASK_USER_LOCK = threading.Lock()
+
 
 def set_channel_context(push, wait_queue) -> None:
     """Call at the start of a channel-driven task thread so ask_user() can
@@ -60,34 +71,41 @@ def clear_channel_context() -> None:
     _channel_ctx.wait_queue = None
 
 
+def get_channel_context():
+    """Read the current thread's channel context, to propagate into a
+    delegate_subtask branch's own worker thread."""
+    return getattr(_channel_ctx, "push", None), getattr(_channel_ctx, "wait_queue", None)
+
+
 def ask_user(question: str) -> str:
-    push = getattr(_channel_ctx, "push", None)
-    wait_queue = getattr(_channel_ctx, "wait_queue", None)
+    with _ASK_USER_LOCK:
+        push = getattr(_channel_ctx, "push", None)
+        wait_queue = getattr(_channel_ctx, "wait_queue", None)
 
-    if push and wait_queue is not None:
+        if push and wait_queue is not None:
+            try:
+                push(f"❓ {question}")
+            except Exception:
+                pass
+            try:
+                answer = wait_queue.get(timeout=ASK_USER_TIMEOUT_SECONDS)
+            except queue.Empty:
+                return T.ask_user_no_answer()
+            return answer.strip() if answer and answer.strip() else T.ask_user_no_answer()
+
+        if not sys.stdin.isatty():
+            # 无渠道、无终端（如纯无头脚本）：把问题抛回给调用方
+            raise _NeedUserInput(question)
+
+        print(f"\n{warn('─' * 50)}")
+        print(f"  {bold(T.ask_user_label())}")
+        print(f"\n  {question}\n")
         try:
-            push(f"❓ {question}")
-        except Exception:
-            pass
-        try:
-            answer = wait_queue.get(timeout=ASK_USER_TIMEOUT_SECONDS)
-        except queue.Empty:
-            return T.ask_user_no_answer()
-        return answer.strip() if answer and answer.strip() else T.ask_user_no_answer()
-
-    if not sys.stdin.isatty():
-        # 无渠道、无终端（如纯无头脚本）：把问题抛回给调用方
-        raise _NeedUserInput(question)
-
-    print(f"\n{warn('─' * 50)}")
-    print(f"  {bold(T.ask_user_label())}")
-    print(f"\n  {question}\n")
-    try:
-        answer = input(f"  {T.ask_user_prompt()} ").strip()
-    except (EOFError, KeyboardInterrupt):
-        raise KeyboardInterrupt
-    print(f"{warn('─' * 50)}\n")
-    return answer if answer else T.ask_user_no_answer()
+            answer = input(f"  {T.ask_user_prompt()} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise KeyboardInterrupt
+        print(f"{warn('─' * 50)}\n")
+        return answer if answer else T.ask_user_no_answer()
 
 
 class _NeedUserInput(Exception):

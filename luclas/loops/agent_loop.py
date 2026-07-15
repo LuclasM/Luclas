@@ -8,25 +8,38 @@ loops/agent_loop.py — 核心执行循环
 import hashlib
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from llm_client import LLMClient
 from tools.registry import execute_tool
 from tools.core_tools import load_core
+from tools.user_input import get_channel_context, set_channel_context, clear_channel_context
 from config import AGENT_MAX_ITERATIONS, AGENT_STALL_WINDOW, AGENT_MAX_ERRORS, SESSION_DIR
 from utils.display import dim, info, ok, err, warn
 import i18n as T
 
 _ANSI_RE = None
 
+# Serializes terminal output across concurrently running delegate branches
+# (each branch is its own run_agent() call on its own thread) so interleaved
+# prints from different branches don't garble mid-line.
+_PRINT_LOCK = threading.Lock()
+
+_DELEGATE_TOOL_NAME = "delegate_subtask"
+
 
 def run_agent(goal: str, task: dict, llm: LLMClient,
               schemas: list, fns: dict,
               task_context: str = "", parent_goal: str = "",
-              progress_callback=None, supplement_queue=None) -> str:
+              progress_callback=None, supplement_queue=None,
+              branch_tag: str = "") -> str:
     """
     执行一个目标，返回最终回答。
     task: dict with id, goal, log (mutated in-place)
     task_context: 工作历史字符串，注入 system prompt
     parent_goal: 父任务目标（子任务时传入）
+    branch_tag: 非空时表示这是一次 delegate_subtask 分支执行，用于给终端输出
+      加前缀，避免和并行跑的其他分支/主线程输出交叉错行。
     """
     core = load_core()
     system_prompt = _build_system(core)
@@ -46,13 +59,15 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
         if supplement_queue is not None:
             _drain_supplements(supplement_queue, messages, task)
 
-        print(T.round_header(iteration, AGENT_MAX_ITERATIONS))
-        if iteration == 1:
-            if parent_goal and parent_goal != goal:
-                print(f"  │  {dim(parent_goal[:70])}")
-                print(f"  │  {'  › ' + info(goal[:66])}")
-            else:
-                print(f"  │  {info(goal[:70])}")
+        with _PRINT_LOCK:
+            tag = f"{dim('[' + branch_tag + ']')} " if branch_tag else ""
+            print(f"{tag}{T.round_header(iteration, AGENT_MAX_ITERATIONS)}")
+            if iteration == 1:
+                if parent_goal and parent_goal != goal:
+                    print(f"{tag}  │  {dim(parent_goal[:70])}")
+                    print(f"{tag}  │  {'  › ' + info(goal[:66])}")
+                else:
+                    print(f"{tag}  │  {info(goal[:70])}")
 
         try:
             turn = llm.agent_turn(messages, schemas)
@@ -74,7 +89,7 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
         tool_calls = turn.get("tool_calls") or []
 
         if thinking.strip():
-            _print_thinking(thinking)
+            _print_thinking(thinking, branch_tag)
             _log(task, _strip_ansi(thinking))
 
         # 无工具调用 → 最终回答
@@ -98,13 +113,69 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
 
         messages.append({"role": "assistant", **turn["raw"]})
 
+        delegate_calls = [tc for tc in tool_calls if tc["function"]["name"] == _DELEGATE_TOOL_NAME]
+        other_calls    = [tc for tc in tool_calls if tc["function"]["name"] != _DELEGATE_TOOL_NAME]
+
+        # Parallel branch dispatch: every delegate_subtask call in this turn runs
+        # concurrently, each on its own thread (LLM/tool calls are I/O-bound, so a
+        # plain thread pool is enough — no asyncio rewrite needed). These are kept
+        # out of the stall/consecutive-error tracking below, which exists to catch
+        # one atomic tool being hammered on repeat, not independent branches.
+        if delegate_calls:
+            # threading.local() channel context (see tools/user_input.py) doesn't
+            # cross into new worker threads on its own — read it here on the
+            # calling thread and re-apply it inside each branch's own thread so
+            # ask_user() still routes to the right messaging channel/terminal.
+            channel_push, channel_wait_queue = get_channel_context()
+
+            def _run_delegate(name, args):
+                set_channel_context(channel_push, channel_wait_queue)
+                try:
+                    return execute_tool(name, args, fns)
+                finally:
+                    clear_channel_context()
+
+            # Announce every branch before waiting on any of them — otherwise the
+            # 2nd+ call's "▶ delegate_subtask" header only prints once we get
+            # around to waiting on it, well after it actually started running.
+            for tc in delegate_calls:
+                _print_tool_call(tc["function"]["name"],
+                                 tc["function"].get("arguments", "{}"), branch_tag)
+
+            pool = ThreadPoolExecutor(max_workers=len(delegate_calls))
+            futures = {
+                tc["id"]: pool.submit(_run_delegate, tc["function"]["name"],
+                                       tc["function"].get("arguments", "{}"))
+                for tc in delegate_calls
+            }
+            for tc in delegate_calls:
+                fn_args = tc["function"].get("arguments", "{}")
+                fut = futures[tc["id"]]
+                while True:
+                    try:
+                        result, is_error = fut.result()
+                        break
+                    except KeyboardInterrupt:
+                        # Background branch threads aren't interruptible (CPython
+                        # only delivers SIGINT to the main thread) — they keep
+                        # running regardless; we can only pause/resume *waiting*
+                        # for them here.
+                        _handle_pause(task, goal, messages)  # 二次 Ctrl-C 时内部 raise
+                    except Exception as e:
+                        result, is_error = f"Delegate execution error: {e}", True
+                        break
+                _print_tool_result(result, is_error, branch_tag)
+                _log(task, f"  {tc['function']['name']}({fn_args[:200]}) → {result[:300]}")
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+            pool.shutdown(wait=False)
+
         tool_interrupted = False
-        for i, tc in enumerate(tool_calls):
+        for i, tc in enumerate(other_calls):
             fn_name = tc["function"]["name"]
             fn_args = tc["function"].get("arguments", "{}")
             tc_id   = tc["id"]
 
-            _print_tool_call(fn_name, fn_args)
+            _print_tool_call(fn_name, fn_args, branch_tag)
 
             try:
                 result, is_error = execute_tool(fn_name, fn_args, fns)
@@ -112,14 +183,14 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
                 # 补全本轮所有未完成的 tool result，否则 LLM API 会报错
                 messages.append({"role": "tool", "tool_call_id": tc_id,
                                   "content": T.sentinel_paused_by_tool()})
-                for rtc in tool_calls[i + 1:]:
+                for rtc in other_calls[i + 1:]:
                     messages.append({"role": "tool", "tool_call_id": rtc["id"],
                                      "content": T.sentinel_skipped()})
                 _handle_pause(task, goal, messages)  # 二次 Ctrl-C 时内部 raise
                 tool_interrupted = True
                 break
 
-            _print_tool_result(result, is_error)
+            _print_tool_result(result, is_error, branch_tag)
 
             # 卡死检测
             args_hash = hashlib.md5(fn_args.encode()).hexdigest()
@@ -132,7 +203,7 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
                     # Complete pending tool results before injecting the system note,
                     # otherwise the API rejects the next call (tool_call_id mismatch).
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
-                    for rtc in tool_calls[i + 1:]:
+                    for rtc in other_calls[i + 1:]:
                         messages.append({"role": "tool", "tool_call_id": rtc["id"],
                                          "content": "[escalating — skipped]"})
                     messages.append({"role": "user", "content": "[系统：检测到循环，已切换模型，请换一种方式继续]"})
@@ -156,7 +227,7 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
                     consecutive_errors = 0
                     _log(task, f"  {fn_name}({fn_args[:200]}) → {result[:300]}")
                     messages.append({"role": "tool", "tool_call_id": tc_id, "content": result})
-                    for rtc in tool_calls[i + 1:]:
+                    for rtc in other_calls[i + 1:]:
                         messages.append({"role": "tool", "tool_call_id": rtc["id"],
                                          "content": "[escalating — skipped]"})
                     messages.append({"role": "user", "content": "[系统：连续错误，已切换模型，请继续]"})
@@ -210,8 +281,9 @@ def _build_user_message(goal: str, task_context: str = "", parent_goal: str = ""
     if parent_goal:
         parts.append(
             f"=== Subtask execution mode ===\n"
-            f"This is one atomic subtask from an already-decomposed plan; the parent task is: {parent_goal}\n"
-            f"Complete only the task below via tool calls. Do not decompose further."
+            f"This is a subtask branched out via delegate_subtask; the calling task is: {parent_goal}\n"
+            f"Prefer completing it directly via tool calls. Only call delegate_subtask again if a "
+            f"genuinely independent chunk of this subtask is worth branching out further."
         )
     parts.append(f"=== Your task ===\n{goal}")
     return "\n\n".join(parts)
@@ -279,30 +351,39 @@ def _truncate(text: str, limit: int = _DISPLAY_LIMIT) -> str:
     return text[:limit] + T.more_chars(len(text))
 
 
-def _print_thinking(thinking: str) -> None:
-    for line in thinking.strip().splitlines():
-        if line.strip():
-            print(f"  {dim('💭 ' + line)}")
+def _tag_prefix(tag: str) -> str:
+    return f"{dim('[' + tag + ']')} " if tag else ""
 
 
-def _print_tool_call(fn_name: str, fn_args: str) -> None:
-    print(f"  {info('▶')} {info(fn_name)}")
-    try:
-        args = json.loads(fn_args) if fn_args else {}
-        budget = _DISPLAY_LIMIT
-        for k, v in args.items():
-            if budget <= 0:
-                print(f"      {dim('…')}")
-                break
-            v_str = _truncate(str(v), budget)
-            print(f"      {dim(k + ':')} {v_str}")
-            budget -= len(v_str)
-    except Exception:
-        if fn_args:
-            print(f"      {dim(_truncate(fn_args))}")
+def _print_thinking(thinking: str, tag: str = "") -> None:
+    head = _tag_prefix(tag)
+    with _PRINT_LOCK:
+        for line in thinking.strip().splitlines():
+            if line.strip():
+                print(f"{head}  {dim('💭 ' + line)}")
 
 
-def _print_tool_result(result: str, is_error: bool) -> None:
+def _print_tool_call(fn_name: str, fn_args: str, tag: str = "") -> None:
+    head = _tag_prefix(tag)
+    with _PRINT_LOCK:
+        print(f"{head}  {info('▶')} {info(fn_name)}")
+        try:
+            args = json.loads(fn_args) if fn_args else {}
+            budget = _DISPLAY_LIMIT
+            for k, v in args.items():
+                if budget <= 0:
+                    print(f"{head}      {dim('…')}")
+                    break
+                v_str = _truncate(str(v), budget)
+                print(f"{head}      {dim(k + ':')} {v_str}")
+                budget -= len(v_str)
+        except Exception:
+            if fn_args:
+                print(f"{head}      {dim(_truncate(fn_args))}")
+
+
+def _print_tool_result(result: str, is_error: bool, tag: str = "") -> None:
+    head   = _tag_prefix(tag)
     icon   = ok("✓") if not is_error else err("✗")
     budget = _DISPLAY_LIMIT
 
@@ -315,64 +396,65 @@ def _print_tool_result(result: str, is_error: bool) -> None:
         budget -= len(out)
         return out
 
-    try:
-        d = json.loads(result)
-        if isinstance(d, dict):
-            if "output" in d:
-                lines = (d.get("output") or "").splitlines()
-                print(f"  {icon} rc={d.get('rc','?')}")
-                for ln in lines:
-                    s = _line(ln)
-                    if s is None:
-                        print(f"      {dim(T.more_lines(len(lines)))}")
-                        break
-                    print(f"      {s}")
-                return
-            if "matches" in d:
-                print(f"  {icon} {T.n_matches(d.get('count', 0))}")
-                for m in d["matches"]:
-                    s = _line(m)
-                    if s is None:
-                        print(f"      {dim('…')}")
-                        break
-                    print(f"      {dim(s)}")
-                return
-            if "files" in d:
-                print(f"  {icon} {T.n_files(d.get('count', len(d['files'])))}")
-                for f in d["files"]:
-                    s = _line(f)
-                    if s is None:
-                        print(f"      {dim('…')}")
-                        break
-                    print(f"      {dim(s)}")
-                return
-            if "results" in d:
-                print(f"  {icon} {T.n_memories(d.get('count', 0))}")
-                for m in d["results"]:
-                    s = _line(str(m.get("content", "")))
-                    if s is None:
-                        print(f"      {dim('…')}")
-                        break
-                    print(f"      {dim(s)}")
-                return
-            if "status" in d:
-                body = d.get("body", "")
-                body_str = json.dumps(body, ensure_ascii=False) if not isinstance(body, str) else body
-                print(f"  {icon} HTTP {d['status']}")
-                if body_str:
-                    print(f"      {dim(_truncate(body_str))}")
-                return
-    except Exception:
-        pass
+    with _PRINT_LOCK:
+        try:
+            d = json.loads(result)
+            if isinstance(d, dict):
+                if "output" in d:
+                    lines = (d.get("output") or "").splitlines()
+                    print(f"{head}  {icon} rc={d.get('rc','?')}")
+                    for ln in lines:
+                        s = _line(ln)
+                        if s is None:
+                            print(f"{head}      {dim(T.more_lines(len(lines)))}")
+                            break
+                        print(f"{head}      {s}")
+                    return
+                if "matches" in d:
+                    print(f"{head}  {icon} {T.n_matches(d.get('count', 0))}")
+                    for m in d["matches"]:
+                        s = _line(m)
+                        if s is None:
+                            print(f"{head}      {dim('…')}")
+                            break
+                        print(f"{head}      {dim(s)}")
+                    return
+                if "files" in d:
+                    print(f"{head}  {icon} {T.n_files(d.get('count', len(d['files'])))}")
+                    for f in d["files"]:
+                        s = _line(f)
+                        if s is None:
+                            print(f"{head}      {dim('…')}")
+                            break
+                        print(f"{head}      {dim(s)}")
+                    return
+                if "results" in d:
+                    print(f"{head}  {icon} {T.n_memories(d.get('count', 0))}")
+                    for m in d["results"]:
+                        s = _line(str(m.get("content", "")))
+                        if s is None:
+                            print(f"{head}      {dim('…')}")
+                            break
+                        print(f"{head}      {dim(s)}")
+                    return
+                if "status" in d:
+                    body = d.get("body", "")
+                    body_str = json.dumps(body, ensure_ascii=False) if not isinstance(body, str) else body
+                    print(f"{head}  {icon} HTTP {d['status']}")
+                    if body_str:
+                        print(f"{head}      {dim(_truncate(body_str))}")
+                    return
+        except Exception:
+            pass
 
-    lines = result.strip().splitlines()
-    print(f"  {icon}")
-    for ln in lines:
-        s = _line(ln)
-        if s is None:
-            print(f"      {dim(T.more_lines(len(lines)))}")
-            break
-        print(f"      {s}")
+        lines = result.strip().splitlines()
+        print(f"{head}  {icon}")
+        for ln in lines:
+            s = _line(ln)
+            if s is None:
+                print(f"{head}      {dim(T.more_lines(len(lines)))}")
+                break
+            print(f"{head}      {s}")
 
 
 def _save_messages(task_id: str, messages: list) -> None:

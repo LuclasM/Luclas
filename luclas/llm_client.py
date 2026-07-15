@@ -41,6 +41,17 @@ class LLMClient:
             self._model_queue = []
             self._current_idx = 0
 
+    def clone(self) -> "LLMClient":
+        """A fresh client sharing the (read-only) router but with its own
+        mutable model-queue/escalation state — required so concurrently
+        running delegate branches don't stomp on each other's set_goal()/
+        escalate() calls when they share the same base LLMClient instance.
+        """
+        c = LLMClient(base_url=self._default_base_url, model=self._default_model,
+                      router=self._router)
+        c._default_api_key = self._default_api_key
+        return c
+
     def escalate(self) -> bool:
         """Switch to the next model in the queue. Returns True if a next model exists."""
         if self._model_queue and self._current_idx < len(self._model_queue) - 1:

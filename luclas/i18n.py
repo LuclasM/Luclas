@@ -598,12 +598,30 @@ def compressed_note() -> str:
     return _pick("  (history compressed)", "  （历史记录已压缩）")
 
 
-def decompose_line(goal: str) -> str:
-    return _pick(f"decompose: {goal}", f"分解：{goal}")
+def branch_start_line(goal: str) -> str:
+    return _pick(f"branch: {goal}", f"分支：{goal}")
 
 
-def merge_line(goal: str) -> str:
-    return _pick(f"merge: {goal}", f"合并：{goal}")
+def branch_refused_ancestor() -> str:
+    return _pick(
+        "delegate_subtask refused: this goal duplicates the current task or one of its ancestors "
+        "(infinite-recursion guard) — do this step directly with your own tools instead.",
+        "delegate_subtask 被拒绝：目标和当前任务或其祖先任务重复（防死循环护栏）——请直接用工具完成这一步。",
+    )
+
+
+def branch_depth_review(depth: int) -> str:
+    return _pick(
+        f"depth {depth} exceeds the soft cap — reviewing whether this branch is really necessary",
+        f"深度 {depth} 超过软上限，正在审查这次分支是否真的必要",
+    )
+
+
+def branch_refused_depth(reason: str) -> str:
+    return _pick(
+        f"delegate_subtask refused at this depth: {reason} — do this step directly with your own tools instead.",
+        f"delegate_subtask 在当前深度被拒绝：{reason} —— 请直接用工具完成这一步。",
+    )
 
 
 def current_task_tree_label() -> str:

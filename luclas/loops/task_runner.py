@@ -1,25 +1,40 @@
 """
-loops/task_runner.py — 递归任务分解与执行
+loops/task_runner.py — 单主线执行 + 按需分支（delegate_subtask）
 
-LLM 决定每个节点是否继续分解，无深度限制。
-_run_node 递归调用自身：分解 → 对每个子任务递归 → 合并结果。
-每个节点状态变化后立即持久化整棵树到 DB 和 MemoryStore。
+一个任务从头到尾是一条连续的 run_agent 会话（root）；LLM 在这条会话里按步骤
+推进，遇到值得独立处理的子任务时自己调用 delegate_subtask 工具分支出去
+（TaskRunner._spawn_branch），分支本身又是一条独立、精炼上下文的嵌套
+run_agent 会话，跑完只把最终结果折叠回调用方——分支还可以再分支（递归），
+深度超过软上限后每次再分支前要求 LLM 自我审查是否真的必要。
+决策永远基于已经发生的事实，而不是执行前一次性定死的计划。
+
+任务树（DB 里 task_records.tree 的 JSON 形状：{id, goal, status, result,
+subtasks, atomic}）刻意保持和旧的递归分解模型完全一样——分支现在是"发生了
+才记一笔"而不是"先规划出完整清单"，但落盘的树形状不变，/history、/tasks、
+/log 等既有渲染逻辑、旧的历史任务记录都不需要迁移。
 """
 
 import datetime
 import json
 import re
+import threading
 import uuid
 
 from loops.agent_loop import run_agent
 from loops._upgrade_eval import UpgradeEvaluator
 from memory.task_memory import TaskMemory, _tree_had_failure
-from utils.display import info, dim, ok, err
+from tools.delegate import make_delegate_tool
+from utils.display import info, dim, ok, err, warn
 import i18n as T
 
 # Feedback loop tuning (see TaskRunner._needs_feedback / _maybe_collect_feedback)
 _MAX_FEEDBACK_ROUNDS = 4   # cap on back-and-forth clarifying questions
 _MAX_FEEDBACK_REDOS  = 2   # cap on recursive redo attempts triggered by feedback
+
+# Branch nesting soft cap (see TaskRunner._spawn_branch / _judge_deeper_branch):
+# past this depth, every further delegate_subtask call first goes through an
+# LLM self-review of the whole branch tree before being allowed.
+_MAX_SOFT_DEPTH = 3
 
 
 def _node(goal: str) -> dict:
@@ -48,6 +63,14 @@ class TaskRunner:
         self.supplement_queue  = supplement_queue
         # P0-4: 升级触发机制 - 跟踪 root 任务完成情况
         self._upgrade_evaluator = UpgradeEvaluator(self.llm, self.task_memory, self.mem_store)
+        # Guards the tree-append + _save/_write_mem read-modify-write when
+        # multiple delegate_subtask branches finish concurrently (parallel
+        # dispatch — see loops/agent_loop.py). A single TaskRunner instance
+        # only ever has one root task in flight at a time (both call sites,
+        # luclas.py and api.py, either reuse the instance sequentially or
+        # construct a fresh one per task), so this only needs to protect
+        # concurrent branches *within* one run(), not across runs.
+        self._branch_lock = threading.Lock()
 
     # ── 入口 ─────────────────────────────────────────────
 
@@ -57,14 +80,14 @@ class TaskRunner:
         root         = _node(goal)                   # full goal (with adapter context) for LLM
         record_id   = uuid.uuid4().hex[:12]
         started     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        mem_id      = [None]   # list 让递归内层可以修改
+        mem_id      = [None]   # list 让分支闭包可以修改
         aar_mem_ids: list[str] = []   # 本次任务过程中写入的 AAR 经验记忆，供反馈附加
 
         self._persist(record_id, root, "running", "", [], started, display_goal)
 
         try:
             history_ctx = self.task_memory.build_context(goal)
-            self._run_node(root, root, record_id, started, history_ctx, mem_id, aar_mem_ids, depth=0)
+            self._run_root(root, record_id, started, history_ctx, mem_id, aar_mem_ids)
         except KeyboardInterrupt:
             self._mark_interrupted(root)
             self._persist(record_id, root, "active", T.sentinel_user_interrupted(), [], started, display_goal)
@@ -96,172 +119,195 @@ class TaskRunner:
 
         return final
 
-    # ── 递归核心 ─────────────────────────────────────────
+    # ── 主线程 ───────────────────────────────────────────
 
-    def _run_node(self, node: dict, root: dict, record_id: str, started: str,
-                  history_ctx: str, mem_id: list, aar_mem_ids: list, depth: int,
-                  ancestor_goals: list[str] | None = None,
-                  prior_results: list[dict] | None = None) -> None:
-        indent   = "  " * depth
-        ancestors = ancestor_goals or []
-        prior     = prior_results or []
+    def _run_root(self, root: dict, record_id: str, started: str,
+                  history_ctx: str, mem_id: list, aar_mem_ids: list) -> None:
+        """单条连续的主线程会话：一次 run_agent 贯穿整个任务，遇到值得独立
+        处理的子任务时，LLM 自己调用 delegate_subtask 分支出去（_spawn_branch）。"""
+        delegate_schema, delegate_fn = make_delegate_tool(
+            lambda g, c="": self._spawn_branch(
+                root, g, c, ancestors=[], depth=0,
+                root=root, record_id=record_id, started=started,
+                mem_id=mem_id, aar_mem_ids=aar_mem_ids,
+            )
+        )
+        schemas = self.schemas + [delegate_schema]
+        fns     = {**self.fns, "delegate_subtask": delegate_fn}
 
-        subtask_goals = self._decompose(node["goal"], history_ctx, root, ancestors)
+        task = {"id": uuid.uuid4().hex[:12], "goal": root["goal"],
+                "status": "active", "log": "", "result": ""}
+        root["exec_id"] = task["id"]
 
-        if subtask_goals:
-            node["subtasks"] = [_node(st) for st in subtask_goals]
-            self._print_decompose(node["goal"], subtask_goals, depth)
-            self._save(record_id, root, started)
-            mem_id[0] = self._write_mem(root, mem_id[0])
-
-            child_ancestors = ancestors + [node["goal"]]
-            child_prior: list[dict] = []          # 本层已完成的兄弟结果
-            for child in node["subtasks"]:
-                self._run_node(child, root, record_id, started, history_ctx,
-                               mem_id, aar_mem_ids, depth + 1, child_ancestors, child_prior)
-                # 子节点完成后，把完整结果加入兄弟列表供下一个子节点使用
-                if child["status"] in ("done", "failed"):
-                    child_prior.append({"goal": child["goal"], "result": child["result"]})
-
-            node["status"] = "running"
-            result = self._synthesize(node)
-            node["result"] = result
-            node["status"] = "done"
-            print(f"{indent}{ok('◉')} {T.merge_line(node['goal'][:60])}")
-
-        else:
-            node["atomic"] = True
-            node["status"] = "running"
-            self._save(record_id, root, started)
-            mem_id[0] = self._write_mem(root, mem_id[0])
-
-            result = self._execute(node, history_ctx, root, ancestors, prior)
-            node["result"] = result
-            node["status"] = "failed" if _is_failed(result) else "done"
-            icon = ok("✓") if node["status"] == "done" else err("✗")
-            print(f"{indent}  {icon} {node['goal'][:60]}")
-
-            # P0-3: 原子任务完成后自动执行 AAR
-            aar_id = self._auto_aar(node, ancestors)
-            if aar_id:
-                aar_mem_ids.append(aar_id)
-        # 每个节点完成后持久化
+        root["status"] = "running"
         self._save(record_id, root, started)
         mem_id[0] = self._write_mem(root, mem_id[0])
 
-    # ── 分解决策 ─────────────────────────────────────────
+        try:
+            result = run_agent(
+                root["goal"], task, self.llm, schemas, fns,
+                task_context=history_ctx,
+                progress_callback=self.progress_callback,
+                supplement_queue=self.supplement_queue,
+            )
+            root["result"] = result
+            root["status"] = "failed" if _is_failed(result) else "done"
+        except Exception as e:
+            root["status"] = "failed"
+            root["result"] = T.sentinel_exec_error(e)
+            print(err(T.tool_error_line(e)))
 
-    def _decompose(self, goal: str, history_ctx: str, root: dict,
-                   ancestors: list[str]) -> list[str] | None:
-        # 祖先路径中已有相同目标 → 强制原子，防止无限递归
-        if any(_goals_similar(goal, a) for a in ancestors):
-            return None
+        icon = ok("✓") if root["status"] == "done" else err("✗")
+        print(f"{icon} {root['goal'][:60]}")
 
-        tree_ctx     = self._tree_str(root)
-        ancestor_str = " › ".join(ancestors[-3:]) if ancestors else ""
-        history_block  = f"Work history:\n{history_ctx[:600]}\n\n---\n\n" if history_ctx else ""
-        task_path_block = f"Task path: {ancestor_str} › {goal}\n\n" if ancestor_str else ""
+        # P0-3: 没有分支出任何子任务的简单任务，root 自己就是"原子执行单元"
+        # ——补一次 AAR，跟旧模型里 atomic 根节点会跑 AAR 是同一个语义。有过
+        # 分支的任务，各分支自己在 _spawn_branch 里已经各跑过一次了，这里不
+        # 重复（避免同一次任务里对"已经分支过的整体"再摘一遍经验，观感重复）。
+        if not root.get("subtasks"):
+            aar_id = self._auto_aar(root, [])
+            if aar_id:
+                aar_mem_ids.append(aar_id)
+
+        self._save(record_id, root, started)
+        mem_id[0] = self._write_mem(root, mem_id[0])
+
+    # ── 分支执行（delegate_subtask 的实际实现） ──────────
+
+    def _spawn_branch(self, parent_node: dict, goal: str, context: str,
+                      ancestors: list[str], depth: int,
+                      root: dict, record_id: str, started: str,
+                      mem_id: list, aar_mem_ids: list) -> str:
+        """由 delegate_subtask 工具调用：校验 → 建子节点 → 跑一段独立、精炼
+        上下文的嵌套 run_agent → 结果折叠回调用方（只返回最终文本）。
+        分支自己也带一个新的 delegate_subtask（绑定到这个子节点、depth+1），
+        所以分支内部还能再分支，天然支持递归。
+        """
+        indent = "  " * depth
+
+        # 护栏一：目标和自己或祖先重复 → 防死循环
+        if any(_goals_similar(goal, a) for a in ancestors + [parent_node["goal"]]):
+            return T.branch_refused_ancestor()
+
+        # 护栏二：深度软上限——超过后要求 LLM 自我审查是否真的必要
+        if depth >= _MAX_SOFT_DEPTH:
+            print(f"{indent}{warn('⚠')} {T.branch_depth_review(depth)}")
+            allowed, reason = self._judge_deeper_branch(root, goal, depth)
+            if not allowed:
+                print(f"{indent}  {err('✗')} {T.branch_refused_depth(reason)}")
+                return T.branch_refused_depth(reason)
+
+        child = _node(goal)
+        with self._branch_lock:
+            parent_node.setdefault("subtasks", []).append(child)
+            self._save(record_id, root, started)
+            mem_id[0] = self._write_mem(root, mem_id[0])
+        print(f"{indent}{info('◈')} {T.branch_start_line(goal)}")
+
+        child_ancestors = ancestors + [parent_node["goal"]]
+        full_ctx = self._branch_context(goal, context, root, child_ancestors)
+
+        branch_llm = self.llm.clone()
+        branch_llm.set_goal(goal)
+
+        delegate_schema, delegate_fn = make_delegate_tool(
+            lambda g, c="": self._spawn_branch(
+                child, g, c, ancestors=child_ancestors, depth=depth + 1,
+                root=root, record_id=record_id, started=started,
+                mem_id=mem_id, aar_mem_ids=aar_mem_ids,
+            )
+        )
+        schemas = self.schemas + [delegate_schema]
+        fns     = {**self.fns, "delegate_subtask": delegate_fn}
+
+        task = {"id": uuid.uuid4().hex[:12], "goal": goal,
+                "status": "active", "log": "", "result": ""}
+        child["exec_id"] = task["id"]
+
+        try:
+            result = run_agent(
+                goal, task, branch_llm, schemas, fns,
+                task_context=full_ctx,
+                parent_goal=parent_node["goal"],
+                progress_callback=self.progress_callback,
+                supplement_queue=self.supplement_queue,
+                branch_tag=f"b:{child['id']}",
+            )
+            child["result"] = result
+            child["status"] = "failed" if _is_failed(result) else "done"
+        except Exception as e:
+            child["status"] = "failed"
+            child["result"] = T.sentinel_exec_error(e)
+            print(err(T.tool_error_line(e)))
+
+        icon = ok("✓") if child["status"] == "done" else err("✗")
+        print(f"{indent}  {icon} {goal[:60]}")
+
+        with self._branch_lock:
+            self._save(record_id, root, started)
+            mem_id[0] = self._write_mem(root, mem_id[0])
+
+        # P0-3: 分支完成后自动执行 AAR（跟原来 atomic 节点的 AAR 是同一套逻辑）
+        aar_id = self._auto_aar(child, ancestors)
+        if aar_id:
+            aar_mem_ids.append(aar_id)
+
+        return child["result"]
+
+    def _branch_context(self, goal: str, context: str, root: dict,
+                        ancestors: list[str]) -> str:
+        """精炼上下文：只给分支目标 + 调用方主动交代的事实 + 完整任务树（供
+        了解全局）+ 长期记忆检索结果——不拷贝调用方那条对话的原始思考/工具
+        调用记录，避免分支的 prompt 无限膨胀，也避免分支被调用方尚未确认的
+        中间猜测带偏。"""
+        tree_str = self._tree_str_full(root)
+        path     = " › ".join(ancestors + [goal]) if ancestors else goal
+
+        parts = [
+            f"=== Current task tree (for awareness) ===\n{tree_str}\n",
+            f"=== Your branch's execution point ===\n{path}\n",
+        ]
+        if context.strip():
+            parts.append(f"=== Context handed off from the calling task ===\n{context.strip()}\n")
+        parts.append(
+            "[Execution rules] You were branched out via delegate_subtask to handle the task below "
+            "on your own. Use the context above plus your own tools; do not re-derive facts already "
+            "given to you. Return a self-contained final answer — it is the only thing that flows "
+            "back to the caller, so make it complete."
+        )
+
+        fresh_ctx = self.task_memory.build_context(goal)
+        if fresh_ctx:
+            parts.append(fresh_ctx)
+
+        return "\n\n".join(parts)
+
+    def _judge_deeper_branch(self, root: dict, goal: str, depth: int) -> tuple[bool, str]:
+        """深度超过软上限后的审查调用：默认从紧（判断失败也算不通过），
+        要求谨慎细分、在有限深度内收敛完成任务。"""
+        tree_str = self._tree_str_full(root)
         prompt = (
-            f"{history_block}"
-            f"Current task tree:\n{tree_ctx}\n\n---\n\n"
-            f"{task_path_block}"
-            f"Pending task: {goal}\n\n"
-            "Does this task need to be decomposed into multiple independent subtasks?\n"
-            "- Can be done via tool calls or direct reasoning → {\"atomic\": true}\n"
-            "- Needs multiple independent steps → {\"subtasks\": [\"step1\", \"step2\", ...]}\n\n"
-            "Note: subtasks must not duplicate the current task or any ancestor task's goal.\n"
-            "Return JSON only, no other text."
+            f"Branch tree so far:\n{tree_str}\n\n"
+            f"Current branch depth: {depth} (soft cap: {_MAX_SOFT_DEPTH})\n"
+            f"Proposed next branch: {goal}\n\n"
+            "This task has already branched deeper than the normal soft cap. Before allowing yet "
+            "another branch, judge carefully: is a new independent sub-conversation genuinely "
+            "necessary here, or can this be done directly with tools in the current conversation? "
+            "Be conservative — prefer finishing within a limited depth over decomposing further. "
+            "Only approve if the work is truly independent and substantial enough to warrant its "
+            "own sub-conversation.\n\n"
+            'Return JSON only: {"allow": true/false, "reason": "short reason"}'
         )
         try:
-            resp    = self.llm.chat([{"role": "user", "content": prompt}], temperature=0.1)
+            resp    = self.llm.chat([{"role": "user", "content": prompt}], temperature=0.1, max_tokens=200)
             cleaned = re.sub(r'```[a-z]*\n?', '', resp).strip()
             match   = re.search(r'\{.*\}', cleaned, re.DOTALL)
             if match:
                 data = json.loads(match.group())
-                if data.get("atomic"):
-                    return None
-                sts = data.get("subtasks", [])
-                if isinstance(sts, list) and len(sts) >= 2:
-                    # 过滤掉与祖先相似的子任务
-                    filtered = [
-                        str(s).strip() for s in sts
-                        if str(s).strip()
-                        and not any(_goals_similar(str(s), a) for a in ancestors + [goal])
-                    ]
-                    if len(filtered) >= 2:
-                        return filtered
+                return bool(data.get("allow")), str(data.get("reason") or "")
         except Exception:
             pass
-        return None
-
-    # ── 原子执行 ─────────────────────────────────────────
-
-    def _execute(self, node: dict, history_ctx: str,
-                 root: dict, ancestors: list[str],
-                 prior_results: list[dict] | None = None) -> str:
-        prior = prior_results or []
-
-        # 完整任务树（含各节点完整结果，供 LLM 了解全局）
-        tree_str         = self._tree_str_full(root)
-        path             = " › ".join(ancestors + [node["goal"]]) if ancestors else node["goal"]
-        immediate_parent = ancestors[-1] if ancestors else ""
-
-        # 已完成的前置步骤结果（完整，不截断）
-        prior_section = ""
-        if prior:
-            lines = ["=== Completed prior step results (use directly, do not redo) ==="]
-            for i, pr in enumerate(prior, 1):
-                lines.append(f"\n[Step {i}] {pr['goal']}")
-                lines.append(pr["result"])
-            prior_section = "\n".join(lines) + "\n\n"
-
-        full_ctx = (
-            f"=== Current task tree ===\n{tree_str}\n\n"
-            f"=== Current execution point ===\n{path}\n\n"
-            + prior_section +
-            "[Execution rules] This is an atomic subtask produced by the task planner.\n"
-            "1. The 'completed prior step results' above may already contain the actual facts "
-            "you need for this task — data, figures, dates, names, case details, etc., not just "
-            "technical artifacts like paths/cookies/IDs. Extract and reuse them directly. Only "
-            "use tools to fetch information that is genuinely NOT already covered above.\n"
-            "2. Do not redo steps already completed above (e.g. re-querying a system that was "
-            "already queried, re-deriving a fact already stated).\n"
-            "3. Use tools to complete this task. Do not decompose it further.\n"
-        )
-        # 重新拉取最新上下文（任务执行中可能写入了新记忆）
-        fresh_ctx = self.task_memory.build_context(node["goal"])
-        if fresh_ctx:
-            full_ctx += f"\n{fresh_ctx}"
-
-        task = {
-            "id":     uuid.uuid4().hex[:12],
-            "goal":   node["goal"],
-            "status": "active",
-            "log":    "",
-            "result": "",
-        }
-        # Link this node to its execution transcript (SESSION_DIR/messages/{exec_id}.json),
-        # so a failed node can be traced back to the full tool-call log after the fact.
-        node["exec_id"] = task["id"]
-
-        try:
-            result = run_agent(
-                node["goal"], task, self.llm, self.schemas, self.fns,
-                task_context=full_ctx,
-                parent_goal=immediate_parent,
-                progress_callback=self.progress_callback,
-                supplement_queue=self.supplement_queue,
-            )
-            task["result"] = result
-            task["status"] = "done"
-        except Exception as e:
-            task["status"] = "failed"
-            result = T.sentinel_exec_error(e)
-            print(err(T.tool_error_line(e)))
-
-        return result
-
-
+        return False, "review call failed — defaulting to disallow further branching"
 
     def _auto_aar(self, node: dict, ancestors: list[str]) -> str | None:
         """P0-3: 原子任务完成后自动执行 After Action Review。返回写入的记忆 id（若有）。"""
@@ -312,23 +358,6 @@ class TaskRunner:
         except Exception:
             pass  # AAR 失败不应影响主任务
         return None
-
-    def _synthesize(self, node: dict) -> str:
-        lines = [
-            f"Subtask {i+1}: {st['goal']}\nResult: {st['result']}"
-            for i, st in enumerate(node["subtasks"])
-        ]
-        prompt = (
-            f"You completed the task: {node['goal']}\n\n"
-            "Subtask results:\n" + "─" * 40 + "\n"
-            + "\n\n".join(lines)
-            + "\n" + "─" * 40 + "\n\n"
-            "Synthesize the results above into a complete answer to the original task. Be concise and accurate."
-        )
-        try:
-            return self.llm.chat([{"role": "user", "content": prompt}], temperature=0.2)
-        except Exception:
-            return "\n".join(f"{st['goal']}: {st['result'][:200]}" for st in node["subtasks"])
 
     # ── 持久化 ───────────────────────────────────────────
 
@@ -642,25 +671,11 @@ class TaskRunner:
 
     # ── 树显示 ───────────────────────────────────────────
 
-    def _tree_str(self, root: dict) -> str:
-        """终端显示用（结果截断到60字）。"""
-        lines = []
-        self._fmt_node(root, lines, 0)
-        return "\n".join(lines)
-
     def _tree_str_full(self, root: dict) -> str:
         """注入 LLM context 用（结果完整，不截断）。"""
         lines = []
         self._fmt_node_full(root, lines, 0)
         return "\n".join(lines)
-
-    def _fmt_node(self, node: dict, lines: list, depth: int) -> None:
-        icon   = {"pending": "○", "running": "▶", "done": "✓", "failed": "✗"}.get(node["status"], "?")
-        indent = "  " * depth
-        result = f" → {node['result'][:60]}" if node.get("result") else ""
-        lines.append(f"{indent}[{icon}] {node['goal']}{result}")
-        for st in node.get("subtasks", []):
-            self._fmt_node(st, lines, depth + 1)
 
     def _fmt_node_full(self, node: dict, lines: list, depth: int) -> None:
         """完整结果版本，供 LLM context 使用。"""
@@ -688,12 +703,6 @@ class TaskRunner:
                 node["result"] = T.sentinel_user_interrupted()
         for st in node.get("subtasks", []):
             self._mark_interrupted(st)
-
-    def _print_decompose(self, goal: str, subtasks: list[str], depth: int) -> None:
-        indent = "  " * depth
-        print(f"\n{indent}{info('◈')} {T.decompose_line(goal)}")
-        for i, st in enumerate(subtasks, 1):
-            print(f"{indent}  {dim(str(i) + '.')} {st}")
 
 
 # ── 模块级辅助 ────────────────────────────────────────────

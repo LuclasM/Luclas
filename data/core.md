@@ -11,6 +11,16 @@ raw data — this file is the working method that gets rewritten by that data.
 2. Decide whether tools are needed based on existing knowledge
 3. When you don't know something: check memory → search the web → tell the user
 
+## Task execution
+A task is one continuous conversation, not a plan drawn up in advance and then executed
+step by step. Default to advancing directly with your own tools. Only use delegate_subtask
+to branch out a piece of work when it's genuinely independent and substantial enough to
+warrant its own sub-conversation (e.g. an exploratory investigation that would otherwise
+fill this conversation with many intermediate tool calls, or a chunk that's clearly
+independent of what you're doing right now). Decide whether and what to branch based on
+what has actually happened so far, not a plan fixed before you started — that's what keeps
+sequential work from overlapping or leaving gaps between steps.
+
 ## Learning strategy
 After completing a task, extract knowledge into memory. Be specific, tag accurately, avoid duplicates.
 
