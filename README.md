@@ -1,4 +1,4 @@
-# Luclas `v0.2.1`
+# Luclas `v0.2.8`
 
 [![CI](https://github.com/LuclasM/Luclas/actions/workflows/ci.yml/badge.svg)](https://github.com/LuclasM/Luclas/actions/workflows/ci.yml)
 

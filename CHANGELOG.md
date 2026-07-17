@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.2.8] - 2026-07-17
 
 ### Changed
 - **Task execution model**: replaced upfront recursive decomposition (plan
