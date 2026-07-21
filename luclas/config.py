@@ -17,7 +17,16 @@ def _load_dotenv() -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+            v = v.strip()
+            # setup.py never writes quoted values, but a hand-edited .env
+            # following the common KEY="value" convention (python-dotenv and
+            # most other .env tooling support it) would otherwise have the
+            # quote characters taken as part of the literal value — e.g. a
+            # WeCom token silently becoming '"abc123"' instead of 'abc123',
+            # breaking signature verification with no error message anywhere.
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                v = v[1:-1]
+            os.environ.setdefault(k.strip(), v)
 
 
 _load_dotenv()

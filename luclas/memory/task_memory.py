@@ -87,14 +87,45 @@ class TaskMemory:
         if count < self.ARCHIVE_THRESHOLD:
             return False
 
+        # Select-then-claim in one connection/transaction: api.py runs one
+        # TaskRunner per session, all sharing this same TaskMemory instance,
+        # and every task's run() calls maybe_compress() on completion — two
+        # sessions finishing close together would otherwise both select the
+        # same oldest-20 batch, each run their own (slow) LLM summarization
+        # call over it, and both write a task_summaries row covering
+        # identical records, permanently duplicated (build_context() has no
+        # dedup and surfaces both forever). The claiming UPDATE is
+        # conditioned on tier still being 'archived', so whichever caller's
+        # UPDATE commits first wins the batch outright — SQLite serializes
+        # writers, so the second caller's UPDATE (against the same ids) is
+        # guaranteed to see the first one's already-applied change and
+        # affects zero rows, not a partial/inconsistent set.
         with get_conn() as conn:
             rows = conn.execute("""
                 SELECT id, goal, summary, artifacts, completed_at
                 FROM task_records WHERE tier='archived'
                 ORDER BY completed_at ASC LIMIT ?
             """, (self.COMPRESS_BATCH,)).fetchall()
+            if not rows:
+                return False
+            ids = [r["id"] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            claimed = conn.execute(
+                f"UPDATE task_records SET tier='compressing' WHERE tier='archived' AND id IN ({placeholders})",
+                ids,
+            ).rowcount
 
-        if not rows:
+        if claimed < len(ids):
+            # Another caller claimed this batch (fully or partially) first —
+            # release anything we did manage to claim rather than compress
+            # a batch we don't fully own, and let the next call pick a fresh
+            # (now-different) batch.
+            if claimed:
+                with get_conn() as conn:
+                    conn.executemany(
+                        "UPDATE task_records SET tier='archived' WHERE id=? AND tier='compressing'",
+                        [(rid,) for rid in ids],
+                    )
             return False
 
         lines = []
@@ -119,6 +150,13 @@ Requirements:
         try:
             summary_text = llm.chat([{"role": "user", "content": prompt}], temperature=0.2)
         except Exception:
+            # Release the claim so this batch is retried on a later call
+            # instead of stuck at tier='compressing' forever.
+            with get_conn() as conn:
+                conn.executemany(
+                    "UPDATE task_records SET tier='archived' WHERE id=?",
+                    [(rid,) for rid in ids],
+                )
             return False
 
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")

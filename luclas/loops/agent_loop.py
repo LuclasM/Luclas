@@ -76,8 +76,13 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
             continue
         except RuntimeError as e:
             err_str = str(e)
-            # Escalate on rate-limit, server error, or connection failure
-            if any(sig in err_str for sig in ("429", "502", "503", "Could not connect", "timed out")):
+            # Escalate on rate-limit, server error, or connection failure.
+            # "500" belongs here for the same reason "502"/"503" do — a bare
+            # Internal Server Error from the LLM endpoint (OOM, model still
+            # loading, etc.) is exactly the kind of transient server-side
+            # failure this comment already says should escalate, not the
+            # fatal break below.
+            if any(sig in err_str for sig in ("429", "500", "502", "503", "Could not connect", "timed out")):
                 if llm.escalate():
                     _log(task, f"LLM error, escalated to next model: {err_str[:120]}")
                     continue
@@ -266,14 +271,12 @@ def _build_system(core: str) -> str:
 
 
 def _build_user_message(goal: str, task_context: str = "", parent_goal: str = "") -> str:
-    """Task tree, prior-step status/results, and subtask framing go in the user
-    message, not the system message — this is part of "what to do right now",
-    and models respond more directly and literally to the user turn. The same
-    content buried mid-way through a long system prompt is easy to treat as
-    optional background rather than a binding constraint (see the case-828
-    postmortem: subtasks repeatedly ignored completed prior results and
-    re-fetched data from scratch until manually interrupted).
-    goal is placed last, keeping "what to do now" in the most salient position.
+    """任务树、前置步骤状态/结果、子任务框架说明放进 user message，而不是 system
+    message 里——这些是"这次具体要做什么"的一部分，模型对 user 轮次的内容响应
+    更直接、更字面；埋在大段 system prompt 中段的同样内容，很容易被当成可有可
+    无的背景资料而不是必须遵守的约束（2026-07 case 828 复盘：子任务反复无视已
+    完成的前置结果，重新登录 CRM 从头抓取数据，直到用户手动 Ctrl-C 打断）。
+    goal 放在最后，保持"当前要做的事"在结尾、最显眼的位置。
     """
     parts = []
     if task_context.strip():
