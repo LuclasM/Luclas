@@ -13,12 +13,14 @@ import curses
 import json
 import os
 import select
+import shutil
 import sys
 import termios
 import tty
 from typing import Optional
 
 from config import MODELS_CONFIG_PATH
+from llm_router import TASK_TYPES
 from local_llm_detect import fetch_openai_models, scan_local_llm_servers, DETECTED_PROVIDER_LABELS
 
 
@@ -71,17 +73,36 @@ def _getch() -> str:
 def _load() -> list[dict]:
     if not os.path.isfile(MODELS_CONFIG_PATH):
         return []
-    with open(MODELS_CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(MODELS_CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"  {_r('!')} could not read {MODELS_CONFIG_PATH}: {e}", file=sys.stderr)
+        return []
 
 
 def _save(models: list[dict]) -> None:
     parent = os.path.dirname(MODELS_CONFIG_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(MODELS_CONFIG_PATH, "w", encoding="utf-8") as f:
+    # Back up the existing file before overwriting, and write via a temp
+    # file + atomic rename. Without this, a crash mid-write (OOM-kill, disk
+    # full, power loss) leaves a truncated/invalid models.json; load_models()
+    # in llm_router.py silently returns [] on any parse error, which would
+    # wipe the entire LLM routing config with no backup to recover from —
+    # unlike .env, which setup.py already backs up on every rewrite.
+    if os.path.isfile(MODELS_CONFIG_PATH):
+        try:
+            shutil.copy2(MODELS_CONFIG_PATH, MODELS_CONFIG_PATH + ".bak")
+        except Exception:
+            pass
+    tmp_path = MODELS_CONFIG_PATH + f".tmp-{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(models, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, MODELS_CONFIG_PATH)
 
 
 # ── Endpoint discovery ────────────────────────────────────────
@@ -337,7 +358,7 @@ def _form_screen(data: dict, is_new: bool, idx: int) -> bool:
 
     types_def  = ", ".join(data.get("task_types", ["general"]))
     types_raw  = _prompt(
-        "Task types  (comma-sep: general · coding · analysis · legal · research · reflection)",
+        f"Task types  (comma-sep: {' · '.join(TASK_TYPES)})",
         types_def,
     )
     task_types = [t.strip() for t in types_raw.split(",") if t.strip()] or ["general"]
@@ -387,6 +408,21 @@ def _form_screen(data: dict, is_new: bool, idx: int) -> bool:
         models.append(record)
     else:
         if 0 <= idx < len(models):
+            # Only auto-add()'s new-model path checked for a duplicate id —
+            # editing an existing model let its id collide with a *different*
+            # model's id with no warning, silently leaving two entries
+            # sharing one id in models.json.
+            others = {m["id"] for i, m in enumerate(models) if i != idx}
+            if id_val in others:
+                base_id, sfx = id_val, 2
+                while id_val in others:
+                    id_val = f"{base_id}_{sfx}"
+                    sfx += 1
+                sys.stdout.write(
+                    f"  {_y('!')} id '{record['id']}' is already used by another model — saved as '{id_val}' instead.\n"
+                )
+                sys.stdout.flush()
+                record["id"] = id_val
             models[idx] = record
     _save(models)
     return True

@@ -189,7 +189,16 @@ def _step_llm() -> dict[str, str]:
 
     print()
     base_url = _ask("API base URL", base_url_default)
-    api_key  = _ask("API key", key_hint.split()[0] if key_hint else "none")
+    # key_hint is a real usable default only for local providers (e.g. "none"
+    # for vllm, "ollama" for ollama — those servers typically don't check the
+    # key at all). For cloud providers it's a *pattern description*
+    # ("sk-...  (platform.openai.com/api-keys)"), already shown above via
+    # print(f"API key: {key_hint}") — using it as the _ask() default meant a
+    # blank Enter silently wrote that literal placeholder string into .env as
+    # if it were a real key, and every LLM call would then fail with what
+    # looks like an ordinary 401 with no indication the key was never set.
+    default_key = (key_hint.split()[0] if key_hint else "none") if provider in ("ollama", "lmstudio", "vllm") else ""
+    api_key  = _ask("API key", default_key)
     model    = _pick_model(provider, base_url, api_key)
 
     return {
@@ -456,8 +465,24 @@ def run(base_dir: str) -> None:
     _input("  Press Enter to open the model manager…")
 
     if _sys.stdin.isatty():
-        from model_manager import run as _run_model_mgr
+        from model_manager import run as _run_model_mgr, _load as _load_models
         _run_model_mgr()
+        # llm_client.py falls back to LUC_LLM_BASE_URL/LUC_LLM_MODEL/
+        # LUC_LLM_API_KEY before any task has run set_goal() (e.g. the
+        # "online/offline" check right at CLI startup) — mirroring the
+        # first configured model into those env vars means that check has a
+        # real endpoint to test against right after setup finishes, instead
+        # of reporting "offline" against an empty base_url even though
+        # models.json is fully and correctly configured. Also keeps the
+        # documented single-model fallback meaningful if models.json is ever
+        # emptied out later. Routing itself is still fully governed by
+        # models.json whenever it has entries — this doesn't change that.
+        configured = _load_models()
+        if configured:
+            first = configured[0]
+            env_vars["LUC_LLM_BASE_URL"] = first.get("base_url", "")
+            env_vars["LUC_LLM_MODEL"]    = first.get("name", "")
+            env_vars["LUC_LLM_API_KEY"]  = first.get("api_key", "none")
     else:
         print("  (non-interactive — falling back to single-model setup)")
         env_vars.update(_step_llm())
