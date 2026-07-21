@@ -59,10 +59,20 @@ class UpgradeEvaluator:
 
     def evaluate_after_task(self, goal: str, result: str) -> None:
         """任务完成后调用，评估是否需要升级。"""
-        # Whole read-modify-write under one lock, reloading fresh from disk
-        # rather than trusting self._history from construction time — see
-        # _HISTORY_LOCK's comment for why (concurrent sessions each own a
-        # separate UpgradeEvaluator instance).
+        # The read-modify-write of the history file happens under the lock,
+        # reloading fresh from disk rather than trusting self._history from
+        # construction time — see _HISTORY_LOCK's comment for why (concurrent
+        # sessions each own a separate UpgradeEvaluator instance). The actual
+        # assessment call below (self.llm.chat(), a network round-trip) runs
+        # *outside* the lock — every task's completion calls this method, so
+        # holding the lock across a slow LLM call would stall every other
+        # concurrently-finishing task's own bookkeeping behind one
+        # assessment. The cooldown is recorded before releasing the lock
+        # (rather than after the assessment finishes) so a second failure
+        # streak that shows up while the first assessment is still running
+        # doesn't also decide to kick off a redundant one.
+        should_assess = False
+        consecutive_failures = 0
         with _HISTORY_LOCK:
             self._history = self._load_history()
 
@@ -91,21 +101,23 @@ class UpgradeEvaluator:
 
             # 检查连续失败
             recent = self._history["recent_tasks"]
-            consecutive_failures = 0
             for t in reversed(recent):
                 if t["status"] == "failed":
                     consecutive_failures += 1
                 else:
                     break
 
-            if consecutive_failures >= self.UPGRADE_THRESHOLD:
-                self._run_upgrade_assessment(consecutive_failures)
-                # 设置冷却期
+            should_assess = consecutive_failures >= self.UPGRADE_THRESHOLD
+            if should_assess:
+                # 设置冷却期（评估开始前先设，避免并发的第二次失败串又触发一次评估）
                 cooldown_dt = datetime.datetime.now() + datetime.timedelta(hours=self.COOLDOWN_HOUR)
                 self._history["cooldown_until"] = cooldown_dt.isoformat()
                 self._history["last_eval"] = datetime.datetime.now().isoformat()
 
             self._save_history()
+
+        if should_assess:
+            self._run_upgrade_assessment(consecutive_failures)
 
     def _is_failed(self, result: str) -> bool:
         return any(result.startswith(p) for p in T.failed_prefixes())

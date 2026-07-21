@@ -256,6 +256,17 @@ class TaskRunner:
             )
             child["result"] = result
             child["status"] = "failed" if _is_failed(result) else "done"
+        except _NeedUserInput as e:
+            # Unlike the root task (see run()'s own except _NeedUserInput),
+            # a branch has a parent conversation to report back to, so this
+            # stays a contained branch failure rather than propagating and
+            # aborting the whole task tree — the parent LLM can decide how to
+            # proceed (try another approach, or hit the same wall itself at
+            # the root level, where there's genuinely nowhere further to go).
+            # Still worth a clean message instead of the generic
+            # execution-error wording below, so it's obvious what happened.
+            child["status"] = "failed"
+            child["result"] = T.sentinel_needs_input(e.question)
         except Exception as e:
             child["status"] = "failed"
             child["result"] = T.sentinel_exec_error(e)

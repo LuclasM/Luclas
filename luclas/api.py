@@ -183,6 +183,15 @@ def _run_task(task_id: str, goal: str, session_id: str,
     push = _make_push_callback(session_id)
     progress_callback = push  # same channel for progress and completion
 
+    # cron_runner.py submits under a "cron_"-prefixed session_id and delivers
+    # the final result itself by separately polling /result and notifying
+    # (see cron_runner.py:_poll_and_notify) — it doesn't rely on push for
+    # that. push still needs to work for cron sessions (progress_callback,
+    # and ask_user() mid-task), but the *final*-result deliveries below must
+    # be suppressed there, or the user gets the answer twice: once via push,
+    # once again via cron's own poll loop.
+    is_cron = session_id.startswith("cron_")
+
     # Per-task LLM client so concurrent sessions don't share _model_queue / _current_idx.
     # The ModelRouter itself is stateless and safe to share.
     task_llm = LLMClient(router=_llm._router if _llm else None)
@@ -201,21 +210,21 @@ def _run_task(task_id: str, goal: str, session_id: str,
     # Show the full result before any feedback prompt runner.run() may trigger
     # internally (ask_user() pushes to the same channel) — otherwise the
     # feedback question arrives before the user has seen what was produced.
-    on_result = (lambda r: push(r or T.channel_done())) if push else None
+    on_result = (lambda r: push(r or T.channel_done())) if (push and not is_cron) else None
     try:
         result = runner.run(goal, on_result=on_result)
         _set_result(task_id, "done", result)
     except _NeedUserInput as e:
         msg = f"❓ {e.question}"
         _set_result(task_id, "done", msg)
-        if push:
+        if push and not is_cron:
             push(msg)
     except Exception as e:
         msg = str(e)
         print(f"[task {task_id}] failed: {msg}", file=sys.stderr)
         traceback.print_exc()
         _set_result(task_id, "failed", msg)
-        if push:
+        if push and not is_cron:
             push(T.channel_task_failed(msg[:500]))
     finally:
         clear_channel_context()

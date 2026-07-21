@@ -334,6 +334,15 @@ def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False)
         return
 
     poll_threads = []
+    # Two schedules sharing a notify_channel (e.g. the same WeCom user with
+    # two reminders due the same minute) must not be *submitted* concurrently:
+    # /chat treats a second submission to a session that's still "running" as
+    # a supplement into the first task rather than an independent task (see
+    # api.py's /chat handler), which would silently merge the second
+    # schedule's goal into the first's conversation and double up
+    # notifications once both poll loops see the same task_id. Different
+    # channels still submit in parallel — only same-channel ones serialize.
+    channel_last_thread: dict[str, threading.Thread] = {}
 
     for row in rows:
         stype       = row["schedule_type"]
@@ -369,12 +378,16 @@ def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False)
 
         submitted = False
         if not is_terminal:
+            prior = channel_last_thread.get(channel)
+            if prior is not None:
+                prior.join()  # let the previous same-channel task finish before submitting the next
             task_id = _submit_task(row["goal"], channel)
             if task_id:
                 submitted = True
                 t = threading.Thread(target=_poll_and_notify, args=(task_id, channel), daemon=True)
                 t.start()
                 poll_threads.append(t)
+                channel_last_thread[channel] = t
         else:
             submitted = _launch(["--run", row["goal"]], f"sched_{row['id']}")
 
