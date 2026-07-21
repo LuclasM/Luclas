@@ -23,8 +23,8 @@ def _pick(en: str, zh: str) -> str:
 
 def failed_prefixes() -> tuple:
     return _pick(
-        ("(execution error", "(exceeded max iterations", "(interrupted:"),
-        ("（执行异常", "（超出迭代上限", "（中断："),
+        ("(execution error", "(exceeded max iterations", "(interrupted:", "(needs user input"),
+        ("（执行异常", "（超出迭代上限", "（中断：", "（需要用户输入"),
     )
 
 

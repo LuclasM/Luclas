@@ -186,11 +186,24 @@ def _run_task(task_id: str, goal: str, session_id: str,
     # cron_runner.py submits under a "cron_"-prefixed session_id and delivers
     # the final result itself by separately polling /result and notifying
     # (see cron_runner.py:_poll_and_notify) — it doesn't rely on push for
-    # that. push still needs to work for cron sessions (progress_callback,
-    # and ask_user() mid-task), but the *final*-result deliveries below must
-    # be suppressed there, or the user gets the answer twice: once via push,
-    # once again via cron's own poll loop.
+    # that, so the *final*-result deliveries below must be suppressed there,
+    # or the user gets the answer twice: once via push, once again via
+    # cron's own poll loop. push itself still fires for progress_callback.
     is_cron = session_id.startswith("cron_")
+
+    # A cron-triggered task has no live two-way channel: if the user replies
+    # on this channel, that message always arrives under their normal chat
+    # session_id (e.g. "wecom_U123"), never this cron-specific one
+    # ("cron_wecom_U123") — nothing ever routes a reply into *this* session's
+    # queue. So ask_user() must not wait on it: with a real queue, ask_user()
+    # would push the question and then block for up to
+    # ASK_USER_TIMEOUT_SECONDS on an answer that can structurally never
+    # arrive, for every question, including the post-task feedback prompt.
+    # Passing None here makes ask_user() take its immediate _NeedUserInput
+    # path instead — the question still reaches the user (as the task's
+    # final result, via cron's own poll+notify), just without the pointless
+    # wait first.
+    effective_wait_queue = None if is_cron else supplement_queue
 
     # Per-task LLM client so concurrent sessions don't share _model_queue / _current_idx.
     # The ModelRouter itself is stateless and safe to share.
@@ -201,12 +214,12 @@ def _run_task(task_id: str, goal: str, session_id: str,
         task_memory=_task_memory,
         mem_store=_store, session_id=session_id,
         progress_callback=progress_callback,
-        supplement_queue=supplement_queue,
+        supplement_queue=effective_wait_queue,
     )
     # Lets ask_user() (mid-task tool call or the post-task feedback loop) push
     # questions to this channel and block for the reply on the same queue used
     # for mid-task supplements — this thread is dedicated to this one task.
-    set_channel_context(push=push, wait_queue=supplement_queue, session_id=session_id)
+    set_channel_context(push=push, wait_queue=effective_wait_queue, session_id=session_id)
     # Show the full result before any feedback prompt runner.run() may trigger
     # internally (ask_user() pushes to the same channel) — otherwise the
     # feedback question arrives before the user has seen what was produced.

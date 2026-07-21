@@ -256,6 +256,41 @@ def _poll_and_notify(task_id: str, notify_channel: str) -> None:
         _log(f"task result (terminal):\n{result}")
 
 
+def _handle_channel_row(row_id: str, row_name: str, goal: str, channel: str,
+                        stype: str, prior_thread: "threading.Thread | None") -> None:
+    """Runs entirely on its own thread (see _check_scheduled): waits for the
+    previous same-channel row's thread (if any) — so two schedules sharing a
+    channel never submit concurrently — then submits, polls+notifies, and
+    does this row's own last_run/delete bookkeeping. Uses its own sqlite
+    connection since it may run concurrently with other rows' threads and
+    with _check_scheduled's own connection (already closed by the time this
+    runs, for rows that had to wait)."""
+    if prior_thread is not None:
+        prior_thread.join()
+
+    task_id = _submit_task(goal, channel)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if not task_id:
+            # Submission never actually happened — don't count this occurrence
+            # as handled, or a transient outage would silently and permanently
+            # lose it (still bounded to today/this occurrence by the caller's checks).
+            conn.execute("UPDATE scheduled_tasks SET last_run='' WHERE id=?", (row_id,))
+            conn.commit()
+            _log(f"scheduled task [{row_id}] '{row_name}' submission failed — will retry")
+            return
+
+        if stype == "once":
+            conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (row_id,))
+            conn.commit()
+            _log(f"one-time task [{row_id}] deleted after successful trigger")
+    finally:
+        conn.close()
+
+    _poll_and_notify(task_id, channel)
+
+
 def _luclas_running() -> bool:
     if not os.path.isfile(_PID_FILE):
         return False
@@ -340,8 +375,16 @@ def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False)
     # a supplement into the first task rather than an independent task (see
     # api.py's /chat handler), which would silently merge the second
     # schedule's goal into the first's conversation and double up
-    # notifications once both poll loops see the same task_id. Different
-    # channels still submit in parallel — only same-channel ones serialize.
+    # notifications once both poll loops see the same task_id.
+    #
+    # Same-channel rows must therefore wait for their predecessor — but that
+    # wait (bounded by _poll_and_notify's own ~10-minute budget) must happen
+    # on a background thread, not the main loop below: joining on the main
+    # thread would block every *later* row regardless of its own channel,
+    # defeating the parallelism this is meant to preserve for genuinely
+    # unrelated channels due the same minute. So each channel-routed row gets
+    # its own thread immediately; the chaining (and this row's own last_run/
+    # delete bookkeeping) all happens inside that thread via _handle_channel_row.
     channel_last_thread: dict[str, threading.Thread] = {}
 
     for row in rows:
@@ -376,21 +419,21 @@ def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False)
         conn.commit()
         _log(f"scheduled task [{row['id']}] '{row['name']}' triggered")
 
-        submitted = False
         if not is_terminal:
+            # Everything from here — waiting for a same-channel predecessor,
+            # submitting, polling+notifying, and this row's own bookkeeping —
+            # runs on its own thread so the main loop moves on to the next
+            # row immediately, regardless of channel.
             prior = channel_last_thread.get(channel)
-            if prior is not None:
-                prior.join()  # let the previous same-channel task finish before submitting the next
-            task_id = _submit_task(row["goal"], channel)
-            if task_id:
-                submitted = True
-                t = threading.Thread(target=_poll_and_notify, args=(task_id, channel), daemon=True)
-                t.start()
-                poll_threads.append(t)
-                channel_last_thread[channel] = t
-        else:
-            submitted = _launch(["--run", row["goal"]], f"sched_{row['id']}")
+            t = threading.Thread(target=_handle_channel_row,
+                                  args=(row["id"], row["name"], row["goal"], channel, stype, prior),
+                                  daemon=True)
+            t.start()
+            poll_threads.append(t)
+            channel_last_thread[channel] = t
+            continue
 
+        submitted = _launch(["--run", row["goal"]], f"sched_{row['id']}")
         if not submitted:
             # Submission never actually happened — don't count this occurrence
             # as handled, or a transient outage would silently and permanently
