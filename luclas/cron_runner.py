@@ -256,39 +256,118 @@ def _poll_and_notify(task_id: str, notify_channel: str) -> None:
         _log(f"task result (terminal):\n{result}")
 
 
-def _handle_channel_row(row_id: str, row_name: str, goal: str, channel: str,
-                        stype: str, prior_thread: "threading.Thread | None") -> None:
-    """Runs entirely on its own thread (see _check_scheduled): waits for the
-    previous same-channel row's thread (if any) — so two schedules sharing a
-    channel never submit concurrently — then submits, polls+notifies, and
-    does this row's own last_run/delete bookkeeping. Uses its own sqlite
-    connection since it may run concurrently with other rows' threads and
-    with _check_scheduled's own connection (already closed by the time this
-    runs, for rows that had to wait)."""
-    if prior_thread is not None:
-        prior_thread.join()
+_CHANNEL_LOCK_STALE_AFTER_SECONDS = 900  # generous margin over _poll_and_notify's ~10-minute budget
 
-    task_id = _submit_task(goal, channel)
 
-    conn = sqlite3.connect(DB_PATH)
+def _ensure_channel_lock_table(conn: sqlite3.Connection) -> None:
+    """cron_runner.py is invoked standalone (no guarantee memory.database.init_db()
+    has run in this deployment yet), so make sure the lock table exists here too —
+    cheap and idempotent."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS cron_channel_locks (
+            channel   TEXT PRIMARY KEY,
+            task_id   TEXT DEFAULT '',
+            locked_at TEXT DEFAULT (datetime('now','localtime'))
+        )
+    """)
+
+
+def _try_acquire_channel_lock(channel: str, owner: str) -> bool:
+    """Cross-process channel lock, backed by the shared SQLite DB rather than
+    in-memory state: cron_runner.py is a fresh OS process every minute (no
+    persistent daemon), so an in-process dict can't stop two *different*
+    invocations from both submitting a task on the same channel — the
+    downstream API would silently merge the second submission into the first
+    as a "supplement" instead of running it independently. Both branches
+    below are single atomic statements (INSERT OR IGNORE / UPDATE ... WHERE)
+    with no separate read-then-write step, so this is race-free even under
+    concurrent acquire attempts from other processes — SQLite serializes
+    writers, so by the time a second connection's statement actually runs,
+    it sees the first connection's already-committed result.
+    A lock older than _CHANNEL_LOCK_STALE_AFTER_SECONDS is treated as
+    abandoned (the owning process crashed or was killed) and reclaimable."""
+    now_iso = datetime.datetime.now().isoformat()
     try:
-        if not task_id:
-            # Submission never actually happened — don't count this occurrence
-            # as handled, or a transient outage would silently and permanently
-            # lose it (still bounded to today/this occurrence by the caller's checks).
-            conn.execute("UPDATE scheduled_tasks SET last_run='' WHERE id=?", (row_id,))
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            _ensure_channel_lock_table(conn)
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO cron_channel_locks (channel, task_id, locked_at) VALUES (?,?,?)",
+                (channel, owner, now_iso),
+            )
+            if cur.rowcount > 0:
+                conn.commit()
+                return True
+            cutoff = (datetime.datetime.now()
+                      - datetime.timedelta(seconds=_CHANNEL_LOCK_STALE_AFTER_SECONDS)).isoformat()
+            cur = conn.execute(
+                "UPDATE cron_channel_locks SET task_id=?, locked_at=? WHERE channel=? AND locked_at<?",
+                (owner, now_iso, channel, cutoff),
+            )
             conn.commit()
-            _log(f"scheduled task [{row_id}] '{row_name}' submission failed — will retry")
-            return
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+    except Exception as e:
+        _log(f"channel lock acquire failed for {channel}: {e}")
+        return False
 
-        if stype == "once":
-            conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (row_id,))
+
+def _release_channel_lock(channel: str, owner: str) -> None:
+    # AND task_id=owner guards against releasing a lock this row no longer
+    # actually holds — e.g. this row's own task ran long enough to be
+    # reclaimed as stale by another process before finishing, in which case
+    # releasing unconditionally would drop the *new* owner's lock instead.
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            _ensure_channel_lock_table(conn)
+            conn.execute("DELETE FROM cron_channel_locks WHERE channel=? AND task_id=?", (channel, owner))
             conn.commit()
-            _log(f"one-time task [{row_id}] deleted after successful trigger")
+        finally:
+            conn.close()
+    except Exception as e:
+        _log(f"channel lock release failed for {channel}: {e}")
+
+
+def _handle_channel_row(row_id: str, row_name: str, goal: str, channel: str, stype: str) -> None:
+    """Runs entirely on its own thread (see _check_scheduled), which has
+    already acquired this channel's lock before spawning it: submits,
+    polls+notifies, does this row's own last_run/delete bookkeeping, and
+    always releases the channel lock on the way out. Uses its own sqlite
+    connection since it may run concurrently with other channels' threads and
+    with _check_scheduled's own connection — SQLite serializes writers at the
+    file level, so a generous busy timeout plus not letting a bookkeeping
+    error skip the notify step below matters here: the task itself has
+    already been submitted successfully once task_id is set, so failing to
+    record that locally must never also mean failing to tell the user the
+    result."""
+    try:
+        task_id = _submit_task(goal, channel)
+
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=30)
+            try:
+                if not task_id:
+                    # Submission never actually happened — don't count this occurrence
+                    # as handled, or a transient outage would silently and permanently
+                    # lose it (still bounded to today/this occurrence by the caller's checks).
+                    conn.execute("UPDATE scheduled_tasks SET last_run='' WHERE id=?", (row_id,))
+                    conn.commit()
+                    _log(f"scheduled task [{row_id}] '{row_name}' submission failed — will retry")
+                elif stype == "once":
+                    conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (row_id,))
+                    conn.commit()
+                    _log(f"one-time task [{row_id}] deleted after successful trigger")
+            finally:
+                conn.close()
+        except Exception as e:
+            _log(f"scheduled task [{row_id}] '{row_name}' bookkeeping failed: {e}")
+
+        if task_id:
+            _poll_and_notify(task_id, channel)
     finally:
-        conn.close()
-
-    _poll_and_notify(task_id, channel)
+        _release_channel_lock(channel, row_id)
 
 
 def _luclas_running() -> bool:
@@ -358,7 +437,12 @@ def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False)
     today_date = now.strftime("%Y-%m-%d")
     now_hhmm   = now.strftime("%H:%M")
 
-    conn = sqlite3.connect(DB_PATH)
+    # A generous busy timeout: once rows start spawning _handle_channel_row
+    # threads (each opening its own connection), this connection stays in use
+    # for later rows' bookkeeping concurrently with those threads' writes —
+    # SQLite serializes writers at the file level, and the default 5s timeout
+    # is tighter than ideal for that overlap.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
@@ -370,22 +454,20 @@ def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False)
 
     poll_threads = []
     # Two schedules sharing a notify_channel (e.g. the same WeCom user with
-    # two reminders due the same minute) must not be *submitted* concurrently:
+    # two reminders close together) must not be *submitted* concurrently:
     # /chat treats a second submission to a session that's still "running" as
     # a supplement into the first task rather than an independent task (see
     # api.py's /chat handler), which would silently merge the second
     # schedule's goal into the first's conversation and double up
-    # notifications once both poll loops see the same task_id.
-    #
-    # Same-channel rows must therefore wait for their predecessor — but that
-    # wait (bounded by _poll_and_notify's own ~10-minute budget) must happen
-    # on a background thread, not the main loop below: joining on the main
-    # thread would block every *later* row regardless of its own channel,
-    # defeating the parallelism this is meant to preserve for genuinely
-    # unrelated channels due the same minute. So each channel-routed row gets
-    # its own thread immediately; the chaining (and this row's own last_run/
-    # delete bookkeeping) all happens inside that thread via _handle_channel_row.
-    channel_last_thread: dict[str, threading.Thread] = {}
+    # notifications once both poll loops see the same task_id. This applies
+    # across separate cron_runner.py invocations too, not just within one
+    # pass of this loop — this script is a fresh OS process every minute (no
+    # persistent daemon), and a single row's poll can legitimately take up to
+    # ~10 minutes, so two schedules on the same channel a few minutes apart
+    # are routinely handled by two *different* processes with no shared
+    # in-memory state between them. _try_acquire_channel_lock() is the
+    # cross-process fix (a DB-backed lock, checked and — if busy — deferred
+    # to a later run, before this row is even marked as triggered).
 
     for row in rows:
         stype       = row["schedule_type"]
@@ -412,41 +494,53 @@ def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False)
             _log(f"scheduled task [{row['id']}] '{row['name']}' deferred — interactive session active")
             continue  # last_run untouched — picked up again next run
 
-        conn.execute(
-            "UPDATE scheduled_tasks SET last_run=? WHERE id=?",
-            (now.strftime("%Y-%m-%d %H:%M:%S"), row["id"]),
-        )
-        conn.commit()
-        _log(f"scheduled task [{row['id']}] '{row['name']}' triggered")
+        if not is_terminal and not _try_acquire_channel_lock(channel, row["id"]):
+            _log(f"scheduled task [{row['id']}] '{row['name']}' deferred — channel '{channel}' busy with another in-flight task")
+            continue  # last_run untouched — picked up again once the channel frees up
+
+        try:
+            conn.execute(
+                "UPDATE scheduled_tasks SET last_run=? WHERE id=?",
+                (now.strftime("%Y-%m-%d %H:%M:%S"), row["id"]),
+            )
+            conn.commit()
+            _log(f"scheduled task [{row['id']}] '{row['name']}' triggered")
+        except Exception as e:
+            # Couldn't even mark it triggered — don't proceed as if we had
+            # (that would submit it with no local record of having done so).
+            # Release any lock we just took so it isn't held for nothing.
+            _log(f"scheduled task [{row['id']}] '{row['name']}' failed to record trigger, skipping this run: {e}")
+            if not is_terminal:
+                _release_channel_lock(channel, row["id"])
+            continue
 
         if not is_terminal:
-            # Everything from here — waiting for a same-channel predecessor,
-            # submitting, polling+notifying, and this row's own bookkeeping —
-            # runs on its own thread so the main loop moves on to the next
-            # row immediately, regardless of channel.
-            prior = channel_last_thread.get(channel)
+            # Everything from here — submitting, polling+notifying, this
+            # row's own bookkeeping, and releasing the channel lock — runs on
+            # its own thread so the main loop moves on to the next row
+            # immediately, regardless of channel.
             t = threading.Thread(target=_handle_channel_row,
-                                  args=(row["id"], row["name"], row["goal"], channel, stype, prior),
+                                  args=(row["id"], row["name"], row["goal"], channel, stype),
                                   daemon=True)
             t.start()
             poll_threads.append(t)
-            channel_last_thread[channel] = t
             continue
 
         submitted = _launch(["--run", row["goal"]], f"sched_{row['id']}")
-        if not submitted:
-            # Submission never actually happened — don't count this occurrence
-            # as handled, or a transient outage would silently and permanently
-            # lose it (still bounded to today/this occurrence by the checks above).
-            conn.execute("UPDATE scheduled_tasks SET last_run='' WHERE id=?", (row["id"],))
-            conn.commit()
-            _log(f"scheduled task [{row['id']}] '{row['name']}' submission failed — will retry")
-            continue
-
-        if stype == "once":
-            conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (row["id"],))
-            conn.commit()
-            _log(f"one-time task [{row['id']}] deleted after successful trigger")
+        try:
+            if not submitted:
+                # Submission never actually happened — don't count this occurrence
+                # as handled, or a transient outage would silently and permanently
+                # lose it (still bounded to today/this occurrence by the checks above).
+                conn.execute("UPDATE scheduled_tasks SET last_run='' WHERE id=?", (row["id"],))
+                conn.commit()
+                _log(f"scheduled task [{row['id']}] '{row['name']}' submission failed — will retry")
+            elif stype == "once":
+                conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (row["id"],))
+                conn.commit()
+                _log(f"one-time task [{row['id']}] deleted after successful trigger")
+        except Exception as e:
+            _log(f"scheduled task [{row['id']}] '{row['name']}' bookkeeping failed: {e}")
 
     conn.close()
 

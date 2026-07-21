@@ -56,6 +56,19 @@ def init_db():
                 last_run      TEXT DEFAULT '',
                 created_at    TEXT DEFAULT (datetime('now','localtime'))
             );
+
+            -- cron_runner.py is a fresh OS process per minute (no persistent
+            -- daemon), so an in-memory lock can't stop two *different*
+            -- invocations from both submitting a task on the same messaging
+            -- channel at once (the downstream API silently merges a second
+            -- concurrent submission into the first as a "supplement" instead
+            -- of running it independently). This table is the shared,
+            -- cross-process lock: one row per channel currently in flight.
+            CREATE TABLE IF NOT EXISTS cron_channel_locks (
+                channel   TEXT PRIMARY KEY,
+                task_id   TEXT DEFAULT '',
+                locked_at TEXT DEFAULT (datetime('now','localtime'))
+            );
         """)
     _migrate()
 
@@ -114,6 +127,16 @@ def _migrate():
             pass
         try:
             conn.execute("ALTER TABLE scheduled_tasks ADD COLUMN notify_channel TEXT DEFAULT 'terminal'")
+        except Exception:
+            pass
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS cron_channel_locks (
+                    channel   TEXT PRIMARY KEY,
+                    task_id   TEXT DEFAULT '',
+                    locked_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+            """)
         except Exception:
             pass
 
