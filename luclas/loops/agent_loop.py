@@ -126,10 +126,10 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
             # cross into new worker threads on its own — read it here on the
             # calling thread and re-apply it inside each branch's own thread so
             # ask_user() still routes to the right messaging channel/terminal.
-            channel_push, channel_wait_queue = get_channel_context()
+            channel_push, channel_wait_queue, channel_session_id = get_channel_context()
 
             def _run_delegate(name, args):
-                set_channel_context(channel_push, channel_wait_queue)
+                set_channel_context(channel_push, channel_wait_queue, channel_session_id)
                 try:
                     return execute_tool(name, args, fns)
                 finally:

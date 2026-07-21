@@ -12,6 +12,7 @@ hardcoded its own language regardless of LUC_LANG).
 """
 from __future__ import annotations
 
+import collections
 import os
 import threading
 import time
@@ -26,6 +27,27 @@ LUC_API_KEY  = os.environ.get("LUC_API_KEY", "")
 
 _RETRY_ATTEMPTS    = 3
 _RETRY_BASE_DELAY  = 1.0   # seconds; doubles each attempt (1s, 2s)
+
+# Recent (channel_label, platform message id) pairs already handed off to a
+# worker thread. A platform's webhook delivery will retry if our response is
+# slow enough (WeCom/WhatsApp's own "processing…" ack is a blocking HTTP call
+# — see _dispatch_task below), and without this, that retry would resubmit
+# the identical message as a brand-new task. Bounded FIFO, not TTL-based —
+# good enough to catch retries of the same delivery attempt, which happen
+# within seconds, not to be a durable dedup log.
+_SEEN_MSG_IDS_MAX = 2000
+_seen_msg_ids: "collections.OrderedDict[str, None]" = collections.OrderedDict()
+_seen_msg_ids_lock = threading.Lock()
+
+
+def _already_seen(key: str) -> bool:
+    with _seen_msg_ids_lock:
+        if key in _seen_msg_ids:
+            return True
+        _seen_msg_ids[key] = None
+        if len(_seen_msg_ids) > _SEEN_MSG_IDS_MAX:
+            _seen_msg_ids.popitem(last=False)
+        return False
 
 
 def post_with_retry(url: str, max_retries: int = _RETRY_ATTEMPTS,
@@ -79,8 +101,21 @@ def _submit_task(send: Callable[[str], None], session_id: str, contexted_goal: s
         send(T.channel_submit_failed(e))
 
 
+def _dispatch_task(send: Callable[[str], None], session_id: str, contexted_goal: str) -> None:
+    """The "processing…" ack plus submission, both off the caller's thread.
+    For WeCom/WhatsApp, send() is a blocking HTTP call (worst case ~30s with
+    retries) — running it inline on the webhook route handler (an `async def`
+    on FastAPI's single event loop) would stall every other request on every
+    channel for that whole duration, including this ack itself, which is
+    exactly the kind of slowness that makes the platform retry the webhook
+    delivery in the first place."""
+    send(T.channel_processing())
+    _submit_task(send, session_id, contexted_goal)
+
+
 def handle_incoming(channel_label: str, notify_channel: str, session_id: str,
-                     sender_id: str, content: str, send: Callable[[str], None]) -> None:
+                     sender_id: str, content: str, send: Callable[[str], None],
+                     message_id: str = "") -> None:
     """Shared entry point for all messaging adapters.
 
     channel_label:  human-readable name injected into the task's goal context,
@@ -93,9 +128,15 @@ def handle_incoming(channel_label: str, notify_channel: str, session_id: str,
                      wire format by the caller)
     send:           callback that delivers a text reply back to the sender
                      on this channel
+    message_id:     the platform's own id for this message, if it has one —
+                     used to drop webhook retries of a message we're already
+                     handling instead of submitting it as a second task
     """
     content = content.strip()
     if not content:
+        return
+
+    if message_id and _already_seen(f"{channel_label}:{message_id}"):
         return
 
     if content.startswith("/"):
@@ -106,10 +147,9 @@ def handle_incoming(channel_label: str, notify_channel: str, session_id: str,
         ).start()
         return
 
-    send(T.channel_processing())
     contexted = T.channel_context_prefix(channel_label, sender_id, notify_channel) + content
     threading.Thread(
-        target=_submit_task,
+        target=_dispatch_task,
         args=(send, session_id, contexted),
         daemon=True,
     ).start()

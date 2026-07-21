@@ -9,11 +9,23 @@ import json
 import re
 import datetime
 import os
+import threading
 
 from config import DATA_DIR
 import i18n as T
 
 _UPGRADE_TRIGGER_FILE = os.path.join(DATA_DIR, "upgrade_trigger.json")
+
+# api.py creates a fresh TaskRunner (and hence a fresh UpgradeEvaluator) per
+# /chat call, and different sessions run concurrently on their own threads —
+# without this lock, two tasks finishing close together would each load
+# upgrade_trigger.json, mutate their own in-memory copy, and whichever saves
+# last would silently overwrite the other's recorded task, undercounting
+# consecutive failures. Scoped to this process only (not cross-process safe
+# against e.g. the CLI and the API service touching the same file at once,
+# which would need real file locking) — acceptable here since only one of
+# those is normally running against a given data dir at a time.
+_HISTORY_LOCK = threading.Lock()
 
 
 class UpgradeEvaluator:
@@ -29,7 +41,7 @@ class UpgradeEvaluator:
         self.llm = llm
         self.task_memory = task_memory
         self.mem_store = mem_store
-        self._history = self._load_history()
+        self._history = {}   # populated fresh, under _HISTORY_LOCK, in evaluate_after_task()
 
     def _load_history(self) -> dict:
         try:
@@ -47,46 +59,53 @@ class UpgradeEvaluator:
 
     def evaluate_after_task(self, goal: str, result: str) -> None:
         """任务完成后调用，评估是否需要升级。"""
-        # 检查冷却期
-        cooldown = self._history.get("cooldown_until", "")
-        if cooldown:
-            try:
-                cooldown_dt = datetime.datetime.fromisoformat(cooldown)
-                if datetime.datetime.now() < cooldown_dt:
-                    return  # 冷却期内，跳过
-            except Exception:
-                pass
+        # Whole read-modify-write under one lock, reloading fresh from disk
+        # rather than trusting self._history from construction time — see
+        # _HISTORY_LOCK's comment for why (concurrent sessions each own a
+        # separate UpgradeEvaluator instance).
+        with _HISTORY_LOCK:
+            self._history = self._load_history()
 
-        status = "failed" if self._is_failed(result) else "done"
+            # 检查冷却期
+            cooldown = self._history.get("cooldown_until", "")
+            if cooldown:
+                try:
+                    cooldown_dt = datetime.datetime.fromisoformat(cooldown)
+                    if datetime.datetime.now() < cooldown_dt:
+                        return  # 冷却期内，跳过
+                except Exception:
+                    pass
 
-        # 记录本次任务
-        self._history["recent_tasks"].append({
-            "goal": goal[:100],
-            "status": status,
-            "time": datetime.datetime.now().isoformat(),
-            "result_preview": result[:200],
-        })
+            status = "failed" if self._is_failed(result) else "done"
 
-        # 只保留最近 10 个任务记录
-        self._history["recent_tasks"] = self._history["recent_tasks"][-10:]
+            # 记录本次任务
+            self._history["recent_tasks"].append({
+                "goal": goal[:100],
+                "status": status,
+                "time": datetime.datetime.now().isoformat(),
+                "result_preview": result[:200],
+            })
 
-        # 检查连续失败
-        recent = self._history["recent_tasks"]
-        consecutive_failures = 0
-        for t in reversed(recent):
-            if t["status"] == "failed":
-                consecutive_failures += 1
-            else:
-                break
+            # 只保留最近 10 个任务记录
+            self._history["recent_tasks"] = self._history["recent_tasks"][-10:]
 
-        if consecutive_failures >= self.UPGRADE_THRESHOLD:
-            self._run_upgrade_assessment(consecutive_failures)
-            # 设置冷却期
-            cooldown_dt = datetime.datetime.now() + datetime.timedelta(hours=self.COOLDOWN_HOUR)
-            self._history["cooldown_until"] = cooldown_dt.isoformat()
-            self._history["last_eval"] = datetime.datetime.now().isoformat()
+            # 检查连续失败
+            recent = self._history["recent_tasks"]
+            consecutive_failures = 0
+            for t in reversed(recent):
+                if t["status"] == "failed":
+                    consecutive_failures += 1
+                else:
+                    break
 
-        self._save_history()
+            if consecutive_failures >= self.UPGRADE_THRESHOLD:
+                self._run_upgrade_assessment(consecutive_failures)
+                # 设置冷却期
+                cooldown_dt = datetime.datetime.now() + datetime.timedelta(hours=self.COOLDOWN_HOUR)
+                self._history["cooldown_until"] = cooldown_dt.isoformat()
+                self._history["last_eval"] = datetime.datetime.now().isoformat()
+
+            self._save_history()
 
     def _is_failed(self, result: str) -> bool:
         return any(result.startswith(p) for p in T.failed_prefixes())

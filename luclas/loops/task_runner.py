@@ -24,6 +24,7 @@ from loops.agent_loop import run_agent
 from loops._upgrade_eval import UpgradeEvaluator
 from memory.task_memory import TaskMemory, _tree_had_failure
 from tools.delegate import make_delegate_tool
+from tools.user_input import _NeedUserInput
 from utils.display import info, dim, ok, err, warn
 import i18n as T
 
@@ -93,6 +94,21 @@ class TaskRunner:
             self._persist(record_id, root, "active", T.sentinel_user_interrupted(), [], started, display_goal)
             self._cleanup_mem(mem_id)
             raise
+        except _NeedUserInput as e:
+            # No channel/terminal available to ask on (headless --run/--reflect,
+            # or an API session with no recognized push channel). _run_root lets
+            # this one propagate instead of swallowing it into a generic "failed"
+            # result, so the real caller (api.py:_run_task's own
+            # `except _NeedUserInput`) gets a clean "needs input" signal instead
+            # of a garbled execution-error string — but we still need to persist
+            # the tree here first, or this record would be stuck at tier='running'
+            # forever (same failure mode as an unhandled crash).
+            if not root.get("result"):
+                root["result"] = T.sentinel_needs_input(e.question)
+            self._mark_interrupted(root)
+            self._persist(record_id, root, "active", root["result"], [], started, display_goal)
+            self._cleanup_mem(mem_id)
+            raise
 
         final = root.get("result", T.sentinel_not_completed())
         if on_result:
@@ -152,6 +168,11 @@ class TaskRunner:
             )
             root["result"] = result
             root["status"] = "failed" if _is_failed(result) else "done"
+        except _NeedUserInput:
+            # Let this propagate to run() — see its except _NeedUserInput
+            # handler for why this must not be folded into the generic
+            # except Exception below.
+            raise
         except Exception as e:
             root["status"] = "failed"
             root["result"] = T.sentinel_exec_error(e)
@@ -435,7 +456,7 @@ class TaskRunner:
         Returns a decision dict {"action": "redo"|"end", ...} or None if no feedback
         was collected at all.
         """
-        from tools.user_input import ask_user, _NeedUserInput
+        from tools.user_input import ask_user
         if not self._needs_feedback(goal, final, root, started):
             return None
         try:

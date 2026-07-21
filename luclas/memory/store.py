@@ -99,10 +99,12 @@ class MemoryStore:
             params.append(content)
             try:
                 from memory.embedder import encode
-                fields.append("embedding=?")
-                params.append(encode(content))
+                emb = encode(content)
             except Exception:
-                pass
+                emb = None
+            if emb is not None:
+                fields.append("embedding=?")
+                params.append(emb)
         if type      is not None: fields.append("type=?");       params.append(type)
         if tags      is not None: fields.append("tags=?");       params.append(json.dumps(tags, ensure_ascii=False))
         if importance is not None: fields.append("importance=?"); params.append(importance)

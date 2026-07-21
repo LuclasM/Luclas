@@ -151,6 +151,7 @@ async def wecom_receive(
 
     if msg_type == "text":
         content = msg_xml.findtext("Content", "").strip()
+        msg_id  = msg_xml.findtext("MsgId", "")
         dispatch.handle_incoming(
             channel_label="WeCom",
             notify_channel=f"wecom:{user_id}",
@@ -158,6 +159,7 @@ async def wecom_receive(
             sender_id=user_id,
             content=content,
             send=lambda msg: _send_text(user_id, msg),
+            message_id=msg_id,
         )
 
     # 企微要求返回空字符串表示已收到

@@ -7,7 +7,7 @@ from tools.search import grep, find_files, GREP_SCHEMA, FIND_FILES_SCHEMA
 from tools.http_client import http_request, HTTP_REQUEST_SCHEMA
 from tools.memory_tools import make_memory_tools
 from tools.core_tools import core_update, CORE_UPDATE_SCHEMA
-from tools.user_input import ask_user, ASK_USER_SCHEMA
+from tools.user_input import ask_user, ASK_USER_SCHEMA, _NeedUserInput
 from tools.schedule_tools import (
     schedule_add, schedule_list, schedule_delete, schedule_toggle,
     SCHEDULE_ADD_SCHEMA, SCHEDULE_LIST_SCHEMA, SCHEDULE_DELETE_SCHEMA, SCHEDULE_TOGGLE_SCHEMA,
@@ -74,5 +74,12 @@ def execute_tool(fn_name: str, fn_args: str, fns: dict) -> tuple[str, bool]:
         return f"Argument parsing failed: {e}", True
     except TypeError as e:
         return f"Argument error: {e}", True
+    except _NeedUserInput:
+        # ask_user() raised this because there's no channel/terminal to ask
+        # on at all — that's not a normal tool failure to hand back to the
+        # LLM as a retryable error (which just makes it ask the same
+        # unanswerable question again next turn, see loops/task_runner.py's
+        # stall detector). Let it propagate to the real caller instead.
+        raise
     except Exception as e:
         return f"Execution error: {e}", True

@@ -130,6 +130,7 @@ def _build_client(discord):
             sender_id=f"{username} (id={user_id})",
             content=content,
             send=_make_channel_send(message.channel),
+            message_id=str(message.id),
         )
 
     return client

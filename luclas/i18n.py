@@ -56,6 +56,11 @@ def sentinel_paused_by_tool() -> str:
     return _pick("(tool execution paused by user)", "（工具执行被用户暂停）")
 
 
+def sentinel_needs_input(question: str) -> str:
+    return _pick(f"(needs user input — no channel available to ask: {question})",
+                 f"（需要用户输入，但当前没有可提问的渠道：{question}）")
+
+
 def sentinel_skipped() -> str:
     return _pick("(skipped)", "（跳过）")
 

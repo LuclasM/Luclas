@@ -76,6 +76,13 @@ def _startup() -> None:
               CORE_HIST]:
         os.makedirs(d, exist_ok=True)
     init_db()
+    # Reclaim task_records left stuck at tier='running' by a previous crash —
+    # api.py is a long-lived service, so unlike the CLI (which does this once
+    # per invocation) it would otherwise never happen, and get_running()/
+    # build_context() would keep injecting a phantom "still running" task
+    # into every future task's context indefinitely.
+    from luclas import _cleanup_interrupted_state
+    _cleanup_interrupted_state()
     _router = None
     _loaded = load_models(MODELS_CONFIG_PATH)
     if _loaded:
@@ -124,7 +131,17 @@ class ResultResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _make_push_callback(session_id: str):
-    """Return a send-function for the adapter that owns this session, or None."""
+    """Return a send-function for the adapter that owns this session, or None.
+
+    Scheduled tasks (cron_runner.py) submit under a "cron_"-prefixed session_id
+    (e.g. "cron_wecom_U123") deliberately distinct from a user's own live chat
+    session_id ("wecom_U123") so a scheduled goal never gets merged as a
+    "supplement" into whatever unrelated conversation happens to be running —
+    strip that prefix before matching so channel push (progress/ask_user/
+    errors) still resolves to the right adapter for cron-originated tasks too.
+    """
+    if session_id.startswith("cron_"):
+        session_id = session_id[len("cron_"):]
     if session_id.startswith("wecom_"):
         user_id = session_id[len("wecom_"):]
         from adapters.wecom import _send_text
@@ -180,7 +197,7 @@ def _run_task(task_id: str, goal: str, session_id: str,
     # Lets ask_user() (mid-task tool call or the post-task feedback loop) push
     # questions to this channel and block for the reply on the same queue used
     # for mid-task supplements — this thread is dedicated to this one task.
-    set_channel_context(push=push, wait_queue=supplement_queue)
+    set_channel_context(push=push, wait_queue=supplement_queue, session_id=session_id)
     # Show the full result before any feedback prompt runner.run() may trigger
     # internally (ask_user() pushes to the same channel) — otherwise the
     # feedback question arrives before the user has seen what was produced.

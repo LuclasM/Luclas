@@ -119,6 +119,7 @@ async def whatsapp_receive(request: Request):
             sender_id=phone,
             content=content,
             send=lambda msg: send_text(phone, msg),
+            message_id=msg.get("id", ""),
         )
     except (KeyError, IndexError):
         pass

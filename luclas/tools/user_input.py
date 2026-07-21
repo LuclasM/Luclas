@@ -52,33 +52,57 @@ _channel_ctx = threading.local()
 # thread that spawned them — set_channel_context() must be re-applied inside
 # each branch thread using get_channel_context() read from the caller first.
 #
-# Also guards the ask_user() body process-wide: if two branches ask_user()
+# ask_user() also needs a lock: if two branches of the *same* task ask_user()
 # concurrently over the same channel/terminal, the user's one reply can only
 # resolve one of two waiting wait_queue.get() calls (or two tty prompts would
-# interleave), so at most one ask_user() may be in flight at a time.
-_ASK_USER_LOCK = threading.Lock()
+# interleave), so at most one ask_user() may be in flight per session at a
+# time. That lock must be scoped *per session_id*, not process-wide — api.py
+# serves many independent messaging sessions concurrently (see _run_task),
+# and a single global lock would make an unrelated user's ask_user() block
+# behind whichever other session happened to ask first, for up to
+# ASK_USER_TIMEOUT_SECONDS. session_id is None for the plain-tty/no-channel
+# case (there's genuinely only one terminal then, so one shared lock is
+# correct there). Locks accumulate one per distinct session_id ever seen —
+# unbounded strictly speaking, but bounded in practice by the number of real
+# users on real channels.
+_channel_locks: dict = {}
+_channel_locks_meta_lock = threading.Lock()
 
 
-def set_channel_context(push, wait_queue) -> None:
+def _lock_for_session(session_id) -> threading.Lock:
+    with _channel_locks_meta_lock:
+        lock = _channel_locks.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            _channel_locks[session_id] = lock
+        return lock
+
+
+def set_channel_context(push, wait_queue, session_id=None) -> None:
     """Call at the start of a channel-driven task thread so ask_user() can
     push questions to the user and block for their reply on wait_queue."""
     _channel_ctx.push = push
     _channel_ctx.wait_queue = wait_queue
+    _channel_ctx.session_id = session_id
 
 
 def clear_channel_context() -> None:
     _channel_ctx.push = None
     _channel_ctx.wait_queue = None
+    _channel_ctx.session_id = None
 
 
 def get_channel_context():
     """Read the current thread's channel context, to propagate into a
     delegate_subtask branch's own worker thread."""
-    return getattr(_channel_ctx, "push", None), getattr(_channel_ctx, "wait_queue", None)
+    return (getattr(_channel_ctx, "push", None),
+            getattr(_channel_ctx, "wait_queue", None),
+            getattr(_channel_ctx, "session_id", None))
 
 
 def ask_user(question: str) -> str:
-    with _ASK_USER_LOCK:
+    session_id = getattr(_channel_ctx, "session_id", None)
+    with _lock_for_session(session_id):
         push = getattr(_channel_ctx, "push", None)
         wait_queue = getattr(_channel_ctx, "wait_queue", None)
 
