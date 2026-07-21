@@ -181,11 +181,13 @@ def _run_task(task_id: str, goal: str, session_id: str,
     # questions to this channel and block for the reply on the same queue used
     # for mid-task supplements — this thread is dedicated to this one task.
     set_channel_context(push=push, wait_queue=supplement_queue)
+    # Show the full result before any feedback prompt runner.run() may trigger
+    # internally (ask_user() pushes to the same channel) — otherwise the
+    # feedback question arrives before the user has seen what was produced.
+    on_result = (lambda r: push(r or T.channel_done())) if push else None
     try:
-        result = runner.run(goal)
+        result = runner.run(goal, on_result=on_result)
         _set_result(task_id, "done", result)
-        if push:
-            push(result or T.channel_done())
     except _NeedUserInput as e:
         msg = f"❓ {e.question}"
         _set_result(task_id, "done", msg)
