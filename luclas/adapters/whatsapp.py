@@ -53,21 +53,26 @@ def send_text(phone: str, content: str) -> None:
 
 def _verify_signature(raw_body: bytes, signature_header: str) -> bool:
     """Verify Meta's X-Hub-Signature-256 (HMAC-SHA256 over the raw body, keyed
-    by the app secret). Without WHATSAPP_APP_SECRET configured, anyone who
-    discovers the callback URL could inject fake messages — so this warns
-    loudly once and stays permissive rather than breaking existing setups
-    that haven't added the new env var yet."""
+    by the app secret). Without WHATSAPP_APP_SECRET configured there is no
+    way to verify a request came from Meta at all — a request that reaches
+    here already carries an attacker-controlled sender phone number and
+    message body straight into the agent loop's full tool access (shell_exec,
+    file_read, web_fetch, ...) via dispatch.handle_incoming(). That's not a
+    degrade-gracefully case, it's an open door, so this fails closed (rejects
+    every request) rather than passing everything through — loudly, once,
+    so a misconfigured deployment finds out immediately instead of silently
+    running exposed."""
     global _warned_no_secret
     if not APP_SECRET:
         if not _warned_no_secret:
             print(
-                "[whatsapp] WARNING: WHATSAPP_APP_SECRET not set — webhook signature "
-                "verification is disabled. Anyone who finds your callback URL can "
-                "inject fake messages. Set WHATSAPP_APP_SECRET (App Dashboard → "
-                "Settings → Basic) to enable it."
+                "[whatsapp] ERROR: WHATSAPP_APP_SECRET not set — refusing all webhook "
+                "requests (cannot verify they actually came from Meta, and a forged "
+                "request would get full agent tool access). Set WHATSAPP_APP_SECRET "
+                "(App Dashboard → Settings → Basic) to enable the WhatsApp integration."
             )
             _warned_no_secret = True
-        return True
+        return False
     if not signature_header.startswith("sha256="):
         return False
     expected = hmac.new(APP_SECRET.encode(), raw_body, hashlib.sha256).hexdigest()

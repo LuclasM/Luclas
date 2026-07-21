@@ -1,4 +1,4 @@
-__version__ = "0.2.14"
+__version__ = "0.2.15"
 
 import builtins
 import datetime
@@ -34,6 +34,7 @@ import i18n as T
 
 _ANSI_RE     = re.compile(r'\x1b\[[0-9;]*m')
 _log_file    = None
+_real_print  = None   # the un-patched builtins.print, saved by _start_print_logger()
 _PID_FILE    = os.path.join(DATA_DIR, "luclas.pid")
 _ACTIVE_FILE = os.path.join(DATA_DIR, "last_active")
 
@@ -78,7 +79,21 @@ def _run_headless(goal: str) -> None:
 
     init_db()
     _start_print_logger()
-    _cleanup_interrupted_state()
+    # Deliberately NOT calling _cleanup_interrupted_state() here (unlike the
+    # interactive main() and api.py's own startup) — this function runs on
+    # every single cron-triggered `--run`/`--reflect` invocation, which is
+    # routine and can happen *while api.py is running as a persistent
+    # service* (they're designed to coexist, not mutually exclusive like the
+    # interactive CLI vs cron). _cleanup_interrupted_state() unconditionally
+    # marks every tier='running' task_records row as failed and deletes
+    # task_state memories — it can't tell "stale from a crash" apart from
+    # "genuinely in progress right now in api.py". Running it here would let
+    # a scheduled reminder or nightly reflection randomly clobber a live,
+    # unrelated in-progress task (e.g. a WeChat conversation) just from bad
+    # timing. Zombie cleanup for a genuinely-headless-only deployment (no
+    # interactive CLI, no api.py ever run) still happens eventually the next
+    # time either of those starts — a real but narrow gap, and strictly
+    # safer than the alternative.
 
     session_id  = uuid.uuid4().hex[:8]
     llm         = _make_llm()
@@ -664,12 +679,14 @@ When you discover a better approach, use core_update to update this file.
 # ── 日志 ──────────────────────────────────────────────────
 
 def _start_print_logger():
-    global _log_file
+    global _log_file, _real_print
     log_dir  = os.path.join(SESSION_DIR, "logs")
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".log")
     _log_file = open(log_path, "a", encoding="utf-8", buffering=1)
 
+    # Saved at module level (not just as a local closure variable) so
+    # _stop_print_logger() can actually restore it later.
     _real_print = builtins.print
     def _logged(*args, **kwargs):
         _real_print(*args, **kwargs)
@@ -721,13 +738,21 @@ def _ensure_cron() -> None:
     import subprocess
     cron_entry = f"* * * * * /usr/bin/python3 {CODE_DIR}/cron_runner.py >> {DATA_DIR}/sessions/logs/cron.log 2>&1"
     try:
-        existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
-    except subprocess.CalledProcessError:
-        existing = ""
-    if "cron_runner.py" not in existing:
-        new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
-        subprocess.run(["crontab", "-"], input=new_crontab.encode(), check=True)
-        print(ok("✓ cron_runner registered in crontab"))
+        try:
+            existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
+        except subprocess.CalledProcessError:
+            existing = ""
+        if "cron_runner.py" not in existing:
+            new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
+            subprocess.run(["crontab", "-"], input=new_crontab.encode(), check=True)
+            print(ok("✓ cron_runner registered in crontab"))
+    except FileNotFoundError:
+        # No `crontab` binary on this system — scheduled tasks/nightly reflection
+        # just won't run automatically. Not a reason to crash every interactive
+        # startup over (this runs unconditionally at the top of main()).
+        print(warn("⚠ crontab not found — scheduled tasks and nightly reflection won't run automatically"))
+    except Exception as e:
+        print(warn(f"⚠ could not register cron_runner in crontab: {e}"))
 
 
 def _restart_api_service() -> tuple[bool, str]:
@@ -751,14 +776,19 @@ def _restart_api_service() -> tuple[bool, str]:
 
 
 def _stop_print_logger():
-    global _log_file
-    import builtins as _b
-    # 找回原始 print（模块级保存的那个）
+    global _log_file, _real_print
+    # 找回原始 print（模块级保存的那个）——之前这里用
+    # `builtins.__class__.__dict__.get("print", print)` 试图找回，但模块对象的
+    # __class__（types.ModuleType）根本不含 "print"，永远落到默认值 print，而
+    # 那时 print 早已被 patch 成 _logged 自己，等于什么也没恢复，_log_file 置
+    # None 后后续任何 print() 都会因为 _logged 里 _log_file.write(...) 报错。
     if _log_file:
         path = _log_file.name
         _log_file.close()
         _log_file = None
-        _b.print = _b.__class__.__dict__.get("print", print)
+        if _real_print is not None:
+            builtins.print = _real_print
+            _real_print = None
         sys.stdout.write(T.log_saved(path))
 
 

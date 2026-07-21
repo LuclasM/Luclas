@@ -55,16 +55,28 @@ def grep(pattern: str, path: str = ".", recursive: bool = True,
         flags.append("-r")
     if ignore_case:
         flags.append("-i")
-    flags += ["-m", str(max_results)]
+    # Ask for one more than needed so "exactly max_results matches" can be
+    # told apart from "more than max_results, capped" — with -m max_results
+    # exactly, both cases return the same number of lines and truncated
+    # couldn't be computed correctly.
+    flags += ["-m", str(max_results + 1)]
 
-    cmd = ["grep"] + flags + [pattern, path]
+    # "--" stops grep from treating a pattern starting with "-" (e.g. "-v")
+    # as an option flag instead of the search text.
+    cmd = ["grep"] + flags + ["--", pattern, path]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        # grep's exit codes: 0 = matches found, 1 = no matches (not an error),
+        # 2+ = a real error (bad pattern, path doesn't exist, etc.) — treating
+        # 2+ as "zero matches" would hide the error and look like a clean
+        # empty search.
+        if proc.returncode not in (0, 1):
+            return {"matches": [], "count": 0, "error": (proc.stderr or f"grep exited {proc.returncode}").strip()}
         lines = proc.stdout.splitlines()
         return {
             "matches": lines[:max_results],
-            "count":   len(lines),
-            "truncated": len(lines) >= max_results,
+            "count":   min(len(lines), max_results),
+            "truncated": len(lines) > max_results,
         }
     except subprocess.TimeoutExpired:
         return {"matches": [], "count": 0, "error": "Search timed out"}
@@ -76,11 +88,13 @@ def find_files(pattern: str, path: str = ".", max_results: int = 50) -> dict:
     cmd = ["find", path, "-name", pattern, "-type", "f"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if proc.returncode != 0:
+            return {"files": [], "count": 0, "error": (proc.stderr or f"find exited {proc.returncode}").strip()}
         files = [l for l in proc.stdout.splitlines() if l]
         return {
             "files":     files[:max_results],
-            "count":     len(files),
-            "truncated": len(files) >= max_results,
+            "count":     min(len(files), max_results),
+            "truncated": len(files) > max_results,
         }
     except subprocess.TimeoutExpired:
         return {"files": [], "count": 0, "error": "Search timed out"}

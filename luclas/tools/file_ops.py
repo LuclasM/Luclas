@@ -8,7 +8,12 @@ FILE_READ_SCHEMA = {
     "type": "function",
     "function": {
         "name": "file_read",
-        "description": "Read a file's content as text. Truncated past 8000 characters.",
+        "description": (
+            "Read a file's content as text. Truncated past 8000 characters. The response "
+            "also includes total_lines (the file's real line count) and lines_returned — "
+            "use them with offset to tell whether you've reached the end of the file when "
+            "paginating a large one."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -58,17 +63,22 @@ def file_read(path: str, offset: int = 0, limit: int = None) -> dict:
     try:
         path = os.path.expanduser(path)
         with open(path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-        if offset:
-            lines = lines[offset:]
-        if limit:
+            all_lines = f.readlines()
+        total_lines = len(all_lines)
+        lines = all_lines[offset:] if offset else all_lines
+        # limit=0 must mean "read zero lines", not "unlimited" — `if limit:`
+        # treats 0 as falsy and would silently return the whole remaining file.
+        if limit is not None:
             lines = lines[:limit]
         content = "".join(lines)
-        truncated = len(content) > 8000
         return {
-            "content":   content[:8000],
-            "truncated": truncated,
-            "total_lines": len(lines),
+            "content":        content[:8000],
+            "truncated":      len(content) > 8000,   # cut off by the 8000-char cap specifically
+            "total_lines":    total_lines,             # the file's real line count
+            "lines_returned": len(lines),               # how many of those this response covers
+            # total_lines/lines_returned/offset together tell a caller paginating
+            # a large file whether it's reached EOF, independent of whether the
+            # char cap above also kicked in.
         }
     except FileNotFoundError:
         return {"error": f"File not found: {path}"}
@@ -95,7 +105,11 @@ def file_list(path: str = ".", recursive: bool = False) -> dict:
             for root, dirs, files in os.walk(path):
                 for fname in files:
                     result.append(os.path.join(root, fname))
-            return {"entries": result[:200]}
+            return {
+                "entries":   result[:200],
+                "count":     len(result),
+                "truncated": len(result) > 200,
+            }
         else:
             entries = os.listdir(path)
             return {"entries": sorted(entries)}

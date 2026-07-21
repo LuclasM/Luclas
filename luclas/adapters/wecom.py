@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import os
 import struct
 import threading
@@ -67,20 +68,54 @@ def _aes_key() -> bytes:
 
 
 def _decrypt(encrypt_b64: str) -> str:
-    data    = base64.b64decode(encrypt_b64)
-    cipher  = AES.new(_aes_key(), AES.MODE_CBC, data[:16])
-    plain   = cipher.decrypt(data[16:])
-    pad     = plain[-1]
-    plain   = plain[:-pad]
-    # 企微加密格式：msg_len(4B) + msg + corp_id（无随机前缀）
+    """AES-256-CBC + PKCS7 (32-byte blocks). Using data[:16] (the first real
+    ciphertext block) as the IV and decrypting only data[16:] is not a bug —
+    in CBC mode, block N's plaintext depends only on ciphertext blocks N and
+    N-1, so this is mathematically identical to decrypting the whole payload
+    with the real IV (the AES key's own first 16 bytes) and then discarding
+    the first plaintext block, which is exactly WeCom's 16-byte random
+    prefix anyway. What *is* required and was missing: validating the
+    trailing corp_id/receiveid against our own CORP_ID, which the real
+    protocol uses to reject a message encrypted for a different corp's app.
+    """
+    data = base64.b64decode(encrypt_b64)
+    if len(data) < 32:
+        raise ValueError("encrypted payload too short")
+    cipher = AES.new(_aes_key(), AES.MODE_CBC, data[:16])
+    plain  = cipher.decrypt(data[16:])
+
+    pad = plain[-1]
+    if not (1 <= pad <= 32) or pad > len(plain):
+        raise ValueError(f"invalid PKCS7 padding byte: {pad}")
+    plain = plain[:-pad]
+
+    if len(plain) < 4:
+        raise ValueError("decrypted payload too short for msg_len header")
     msg_len = struct.unpack(">I", plain[0:4])[0]
-    return plain[4 : 4 + msg_len].decode("utf-8")
+    if 4 + msg_len > len(plain):
+        raise ValueError("msg_len out of bounds")
+
+    msg = plain[4 : 4 + msg_len].decode("utf-8")
+    receiveid = plain[4 + msg_len:].decode("utf-8", errors="replace")
+    if receiveid != CORP_ID:
+        raise ValueError(f"corp_id mismatch: payload addressed to {receiveid!r}, this endpoint is {CORP_ID!r}")
+    return msg
+
+
+_TIMESTAMP_FRESHNESS_SECONDS = 300  # WeCom's own recommended replay-window tolerance
+
+
+def _is_fresh_timestamp(timestamp: str) -> bool:
+    try:
+        return abs(time.time() - int(timestamp)) <= _TIMESTAMP_FRESHNESS_SECONDS
+    except (TypeError, ValueError):
+        return False
 
 
 def _verify_signature(signature: str, timestamp: str, nonce: str, echostr_or_encrypt: str) -> bool:
     items = sorted([TOKEN, timestamp, nonce, echostr_or_encrypt])
     computed = hashlib.sha1("".join(items).encode("utf-8")).hexdigest()
-    return computed == signature
+    return hmac.compare_digest(computed, signature) and _is_fresh_timestamp(timestamp)
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +156,11 @@ async def wecom_verify(
     """企微回调 URL 验证"""
     if not _verify_signature(msg_signature, timestamp, nonce, echostr):
         return Response("signature error", status_code=403)
-    plain = _decrypt(echostr)
+    try:
+        plain = _decrypt(echostr)
+    except Exception as e:
+        print(f"[wecom] decrypt failed on URL verification: {e}")
+        return Response("decrypt error", status_code=403)
     return Response(plain, media_type="text/plain")
 
 
@@ -143,8 +182,12 @@ async def wecom_receive(
     if not _verify_signature(msg_signature, timestamp, nonce, encrypt):
         return Response("signature error", status_code=403)
 
-    plain   = _decrypt(encrypt)
-    msg_xml = ET.fromstring(plain)
+    try:
+        plain   = _decrypt(encrypt)
+        msg_xml = ET.fromstring(plain)
+    except Exception as e:
+        print(f"[wecom] decrypt/parse failed: {e}")
+        return Response("decrypt error", status_code=403)
 
     msg_type = msg_xml.findtext("MsgType", "")
     user_id  = msg_xml.findtext("FromUserName", "")
