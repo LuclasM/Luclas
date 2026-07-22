@@ -5,7 +5,7 @@
 ```bash
 git clone <your fork>
 cd Luclas_Open
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 cp .env.example .env   # set LUC_LLM_BASE_URL and LUC_LLM_MODEL
 ./luclas.sh
 ```
@@ -18,11 +18,20 @@ cp .env.example .env   # set LUC_LLM_BASE_URL and LUC_LLM_MODEL
    ```bash
    python -m compileall -q luclas
    ruff check --select E9,F63,F7,F82 luclas
+   python -m pytest tests/
    ```
-   There's no test suite yet — these two checks catch syntax errors, broken
-   imports, and undefined names. If your change touches behavior that's easy
-   to break silently (memory, task decomposition, adapters), test it manually
-   and describe how in the PR.
+   `tests/` is deliberately narrow — it only covers the handful of
+   concurrency/race-condition bugs found so far (cron's cross-process
+   channel lock, memory compression, the embedding model's lazy load,
+   `ask_user()`'s per-session lock, the Discord adapter's reconnect
+   handling). These are exactly the class of bug that's invisible from
+   reading the code or from a single manual run, and easy to silently
+   reintroduce with an unrelated change — that's what these tests guard
+   against. Most other behavior doesn't have a permanent test; if your
+   change touches something that isn't covered (memory, task decomposition,
+   other adapter behavior), test it manually and describe how in the PR. If
+   you're fixing a race condition, please add a test for it here rather than
+   just verifying by hand.
 4. Open a PR against `master`. CI (`.github/workflows/ci.yml`) runs the same
    checks automatically.
 

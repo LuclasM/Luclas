@@ -18,6 +18,7 @@ sessions/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # Misc scratch files
 *.html
