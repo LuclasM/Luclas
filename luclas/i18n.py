@@ -6,7 +6,7 @@ to the LLM are deliberately NOT localized — they stay in English regardless
 of LUC_LANG, since the model's output language is governed by core.md and
 the conversation content, not by the scaffold prompt's language.
 
-Usage: import i18n as T; print(T.startup_banner())
+Usage: import i18n as T; print(T.ascii_banner())
 """
 import random
 
@@ -310,7 +310,7 @@ def session_id_line(sid: str) -> str:
 
 
 def goodbye() -> str:
-    return _pick("再见" if _ZH else "Goodbye", "再见")
+    return _pick("Goodbye", "再见")
 
 
 def goodbye_nl() -> str:
@@ -318,11 +318,11 @@ def goodbye_nl() -> str:
 
 
 def task_started() -> str:
-    return _pick("任务开始" if _ZH else "Task started", "任务开始")
+    return _pick("Task started", "任务开始")
 
 
 def task_done() -> str:
-    return _pick("完成" if _ZH else "Done", "完成")
+    return _pick("Done", "完成")
 
 
 def task_interrupted() -> str:
@@ -367,7 +367,7 @@ def api_restart_failed(service: str, detail: str) -> str:
 # ── status / whoami ─────────────────────────────────────────────────────────
 
 def status_title() -> str:
-    return _pick("系统状态" if _ZH else "System Status", "系统状态")
+    return _pick("System Status", "系统状态")
 
 
 def status_memory(n: int) -> str:
