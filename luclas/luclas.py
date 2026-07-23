@@ -303,6 +303,9 @@ def _show_status(store: MemoryStore, task_memory: TaskMemory):
     snap_count = len(os.listdir(CORE_HIST)) if os.path.isdir(CORE_HIST) else 0
     print(T.status_policy_versions(snap_count))
     print(T.status_history(tm['active'], tm.get('running', 0), tm['archived'], tm['summarized'], tm['summaries']))
+    from llm_client import usage_summary
+    u = usage_summary(days=1)
+    print(T.status_token_usage(u["calls"], u["total_tokens"], u["all_time_calls"], u["all_time_total_tokens"]))
     print()
 
 

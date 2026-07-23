@@ -370,6 +370,7 @@ def status():
     llm_ok    = _llm.is_available() if _llm else False
     mem_count = _store.count()      if _store else 0
     pending   = sum(1 for v in _results.values() if v["status"] == "running")
+    from llm_client import usage_summary
     return {
         "llm":          "online" if llm_ok else "offline",
         "model":        _llm.model    if _llm else LLM_MODEL,
@@ -377,6 +378,7 @@ def status():
         "memory_count": mem_count,
         "pending":      pending,
         "channels":     _channel_health(),
+        "token_usage_24h": usage_summary(days=1),
     }
 
 

@@ -390,6 +390,15 @@ def status_history(active, running, archived, summarized, summaries) -> str:
     )
 
 
+def status_token_usage(calls: int, total_tokens: int, all_time_calls: int, all_time_total_tokens: int) -> str:
+    return _pick(
+        f"  Token usage:   {total_tokens:,} tokens / {calls} call(s) in the last 24h "
+        f"(all-time: {all_time_total_tokens:,} tokens / {all_time_calls} calls)",
+        f"  Token 用量：  最近 24 小时 {total_tokens:,} tokens / {calls} 次调用"
+        f"（累计：{all_time_total_tokens:,} tokens / {all_time_calls} 次）",
+    )
+
+
 def models_title(n: int) -> str:
     return _pick(f"Model Configuration ({n})", f"模型配置（{n} 个）")
 

@@ -1,5 +1,7 @@
+import datetime
 import json
 import time
+import uuid
 import requests
 from config import LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
 
@@ -153,7 +155,9 @@ class LLMClient:
                     timeout=300,
                 )
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                self._record_usage(data)
+                return data
             except requests.exceptions.ConnectionError:
                 last_err = RuntimeError(f"Could not connect to LLM service ({self.base_url})")
             except requests.exceptions.Timeout:
@@ -164,3 +168,66 @@ class LLMClient:
             if attempt < retries - 1:
                 time.sleep(retry_delay)
         raise last_err
+
+    def _record_usage(self, data: dict) -> None:
+        """Every OpenAI-compatible response carries a `usage` field, which
+        was previously just discarded — there was no token-usage visibility
+        anywhere, so a runaway task (or a model quietly costing far more per
+        call than expected) had no signal short of an actual bill. Recording
+        this must never be allowed to break a real LLM call, so any failure
+        here (including the endpoint just not returning `usage` at all,
+        which some local/self-hosted servers don't) is silently swallowed."""
+        usage = data.get("usage")
+        if not usage:
+            return
+        try:
+            from memory.database import get_conn
+            with get_conn() as conn:
+                conn.execute(
+                    "INSERT INTO llm_usage (id, model, prompt_tokens, completion_tokens, total_tokens) "
+                    "VALUES (?,?,?,?,?)",
+                    (
+                        uuid.uuid4().hex[:12],
+                        self.model,
+                        usage.get("prompt_tokens", 0),
+                        usage.get("completion_tokens", 0),
+                        usage.get("total_tokens", 0),
+                    ),
+                )
+        except Exception:
+            pass
+
+
+def usage_summary(days: int = 1) -> dict:
+    """Aggregate token usage over the last `days` days, plus an all-time
+    total and a per-model breakdown for the period — used by api.py's
+    /status and the CLI's /status command."""
+    from memory.database import get_conn
+    since = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        recent = conn.execute(
+            "SELECT COALESCE(SUM(prompt_tokens),0) as p, COALESCE(SUM(completion_tokens),0) as c, "
+            "COALESCE(SUM(total_tokens),0) as t, COUNT(*) as n FROM llm_usage WHERE created_at >= ?",
+            (since,),
+        ).fetchone()
+        all_time = conn.execute(
+            "SELECT COALESCE(SUM(total_tokens),0) as t, COUNT(*) as n FROM llm_usage"
+        ).fetchone()
+        by_model = conn.execute(
+            "SELECT model, COALESCE(SUM(total_tokens),0) as t, COUNT(*) as n FROM llm_usage "
+            "WHERE created_at >= ? GROUP BY model ORDER BY t DESC",
+            (since,),
+        ).fetchall()
+    return {
+        "period_days":          days,
+        "prompt_tokens":        recent["p"],
+        "completion_tokens":    recent["c"],
+        "total_tokens":         recent["t"],
+        "calls":                recent["n"],
+        "all_time_total_tokens": all_time["t"],
+        "all_time_calls":       all_time["n"],
+        "by_model": [
+            {"model": r["model"] or "(unknown)", "total_tokens": r["t"], "calls": r["n"]}
+            for r in by_model
+        ],
+    }

@@ -239,11 +239,41 @@ def _notify_admin(content: str) -> None:
         _log(f"LUC_ADMIN_NOTIFY has an unrecognized format: {target!r} (expected wecom:/whatsapp:/discord:)")
 
 
+def _apply_health_check(state: dict, name: str, healthy: bool, now: datetime.datetime,
+                        down_message: str, recovered_message: str) -> None:
+    """Shared alert-decision logic for one named check (a channel, the LLM
+    endpoint, the daily token budget, ...): a fresh failure or a recovery
+    always alerts immediately; an already-known ongoing failure only
+    re-alerts every _HEALTH_ALERT_COOLDOWN_HOURS. Mutates `state` in place;
+    caller is responsible for _save_health_state() once all checks are done."""
+    prev = state.get(name, {"healthy": True, "last_alert": ""})
+    if healthy:
+        if not prev["healthy"]:
+            _notify_admin(recovered_message)
+        state[name] = {"healthy": True, "last_alert": ""}
+        return
+
+    just_broke  = prev["healthy"]
+    stale_alert = True
+    if prev.get("last_alert"):
+        try:
+            last_alert_dt = datetime.datetime.fromisoformat(prev["last_alert"])
+            stale_alert = (now - last_alert_dt).total_seconds() >= _HEALTH_ALERT_COOLDOWN_HOURS * 3600
+        except Exception:
+            stale_alert = True
+
+    if just_broke or stale_alert:
+        _notify_admin(down_message)
+        state[name] = {"healthy": False, "last_alert": now.isoformat()}
+    else:
+        state[name] = {"healthy": False, "last_alert": prev.get("last_alert", "")}
+
+
 def _check_channel_health(now: datetime.datetime) -> None:
-    """Runs every _HEALTH_CHECK_INTERVAL_MINUTES minutes. A persisted state
-    file means a still-ongoing failure only re-alerts every
-    _HEALTH_ALERT_COOLDOWN_HOURS, not on every single check, while a fresh
-    failure or a recovery always alerts immediately."""
+    """Runs every _HEALTH_CHECK_INTERVAL_MINUTES minutes. Also checks
+    LUC_DAILY_TOKEN_BUDGET (if set) against the same /status response's
+    24h token usage — no extra query needed, and it's the same "you'd only
+    find out from a surprise bill" blind spot this whole check exists for."""
     if not os.environ.get("LUC_ADMIN_NOTIFY", "").strip():
         return  # opt-in — nothing configured to notify, nothing to check
     if now.minute % _HEALTH_CHECK_INTERVAL_MINUTES != 0:
@@ -263,40 +293,44 @@ def _check_channel_health(now: datetime.datetime) -> None:
         _log(f"health check: could not reach {_API_BASE}/status: {e}")
         return
 
-    checks = {"llm": current.get("llm") == "online"}
+    state = _load_health_state()
+
+    llm_healthy = current.get("llm") == "online"
+    _apply_health_check(
+        state, "llm", llm_healthy, now,
+        down_message="⚠️ Luclas: the LLM endpoint appears to be down.",
+        recovered_message="✅ Luclas: the LLM endpoint is back up.",
+    )
+
     for ch, info in (current.get("channels") or {}).items():
-        if info.get("configured") and "healthy" in info:
-            checks[ch] = info["healthy"]
-
-    state   = _load_health_state()
-    now_iso = now.isoformat()
-
-    for name, healthy in checks.items():
-        prev = state.get(name, {"healthy": True, "last_alert": ""})
-        if healthy:
-            if not prev["healthy"]:
-                _notify_admin(f"✅ Luclas: {name} is back up.")
-            state[name] = {"healthy": True, "last_alert": ""}
+        if not (info.get("configured") and "healthy" in info):
             continue
+        detail = info.get("detail", "")
+        down_msg = f"⚠️ Luclas: {ch} appears to be down."
+        if detail:
+            down_msg += f" ({detail})"
+        _apply_health_check(
+            state, ch, info["healthy"], now,
+            down_message=down_msg,
+            recovered_message=f"✅ Luclas: {ch} is back up.",
+        )
 
-        just_broke  = prev["healthy"]
-        stale_alert = True
-        if prev.get("last_alert"):
-            try:
-                last_alert_dt = datetime.datetime.fromisoformat(prev["last_alert"])
-                stale_alert = (now - last_alert_dt).total_seconds() >= _HEALTH_ALERT_COOLDOWN_HOURS * 3600
-            except Exception:
-                stale_alert = True
-
-        if just_broke or stale_alert:
-            detail = (current.get("channels") or {}).get(name, {}).get("detail", "")
-            msg = f"⚠️ Luclas: {name} appears to be down."
-            if detail:
-                msg += f" ({detail})"
-            _notify_admin(msg)
-            state[name] = {"healthy": False, "last_alert": now_iso}
-        else:
-            state[name] = {"healthy": False, "last_alert": prev.get("last_alert", "")}
+    budget_raw = os.environ.get("LUC_DAILY_TOKEN_BUDGET", "").strip()
+    if budget_raw:
+        try:
+            budget = int(budget_raw)
+        except ValueError:
+            budget = 0
+        if budget > 0:
+            used = (current.get("token_usage_24h") or {}).get("total_tokens", 0)
+            _apply_health_check(
+                state, "token_budget", used <= budget, now,
+                down_message=(
+                    f"⚠️ Luclas: token usage in the last 24h ({used:,}) has exceeded "
+                    f"your configured daily budget ({budget:,})."
+                ),
+                recovered_message=f"✅ Luclas: token usage is back under your daily budget ({budget:,}).",
+            )
 
     _save_health_state(state)
 

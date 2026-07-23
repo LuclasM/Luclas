@@ -69,6 +69,23 @@ def init_db():
                 task_id   TEXT DEFAULT '',
                 locked_at TEXT DEFAULT (datetime('now','localtime'))
             );
+
+            -- One row per LLM call (see llm_client.py:_record_usage) — there
+            -- was previously no visibility into token usage at all, even
+            -- though every OpenAI-compatible response already carries a
+            -- `usage` field that was just being discarded. Rows are tiny and
+            -- not pruned/archived (unlike task_records) — even heavy daily
+            -- use keeps this table small for a long time; revisit if that
+            -- stops being true.
+            CREATE TABLE IF NOT EXISTS llm_usage (
+                id                 TEXT PRIMARY KEY,
+                model              TEXT DEFAULT '',
+                prompt_tokens      INTEGER DEFAULT 0,
+                completion_tokens  INTEGER DEFAULT 0,
+                total_tokens       INTEGER DEFAULT 0,
+                created_at         TEXT DEFAULT (datetime('now','localtime'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_usage_created_at ON llm_usage(created_at);
         """)
     _migrate()
 
@@ -136,6 +153,20 @@ def _migrate():
                     task_id   TEXT DEFAULT '',
                     locked_at TEXT DEFAULT (datetime('now','localtime'))
                 );
+            """)
+        except Exception:
+            pass
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS llm_usage (
+                    id                 TEXT PRIMARY KEY,
+                    model              TEXT DEFAULT '',
+                    prompt_tokens      INTEGER DEFAULT 0,
+                    completion_tokens  INTEGER DEFAULT 0,
+                    total_tokens       INTEGER DEFAULT 0,
+                    created_at         TEXT DEFAULT (datetime('now','localtime'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_llm_usage_created_at ON llm_usage(created_at);
             """)
         except Exception:
             pass
