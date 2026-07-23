@@ -148,8 +148,13 @@ def _make_push_callback(session_id: str):
         def _cb(msg: str):
             try:
                 _send_text(user_id, msg)
-            except Exception:
-                pass
+            except Exception as e:
+                # Previously a bare `except Exception: pass` — a failure here
+                # (e.g. the WeCom access token can no longer be refreshed)
+                # left zero trace anywhere, not even in the log files; the
+                # only way to notice was a user reporting they'd stopped
+                # getting replies. At minimum, log it.
+                print(f"[api] push to wecom user {user_id} failed: {e}", file=sys.stderr)
         return _cb
 
     if session_id.startswith("whatsapp_"):
@@ -158,8 +163,8 @@ def _make_push_callback(session_id: str):
         def _cb(msg: str):
             try:
                 _wa_send(phone, msg)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[api] push to whatsapp {phone} failed: {e}", file=sys.stderr)
         return _cb
 
     if session_id.startswith("discord_"):
@@ -168,8 +173,8 @@ def _make_push_callback(session_id: str):
             try:
                 for i in range(0, max(len(msg), 1), 1900):
                     _dc_send(msg[i:i + 1900])
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[api] push to discord session {session_id} failed: {e}", file=sys.stderr)
         return _cb
 
     return None
@@ -272,6 +277,49 @@ def _now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def _channel_health() -> dict:
+    """Best-effort per-channel health, for /status and cron_runner.py's
+    active health-check alerting (see _check_channel_health there). Not an
+    equally deep check for every platform:
+      - WeCom: a real liveness signal — _get_access_token() reuses its
+        existing cache, so this is a no-op read in the common case and only
+        actually hits the network once the cached token is genuinely close
+        to expiry. This is the case the health-check alerting exists for
+        (a revoked/expired corp secret going unnoticed for days).
+      - Discord: the bot's own connection state is already tracked
+        in-process (_bot_loop/_bot_channel) — free to read, no extra call.
+      - WhatsApp: the Cloud API has no equivalently cheap liveness probe
+        without spending a real API call, so this only reports whether the
+        required credentials are configured, not whether they still work.
+    """
+    result: dict = {}
+
+    from adapters import wecom
+    if wecom.CORP_ID and wecom.SECRET and wecom.AGENT_ID:
+        try:
+            wecom._get_access_token()
+            result["wecom"] = {"configured": True, "healthy": True}
+        except Exception as e:
+            result["wecom"] = {"configured": True, "healthy": False, "detail": str(e)[:200]}
+    else:
+        result["wecom"] = {"configured": False}
+
+    from adapters import whatsapp
+    if whatsapp.PHONE_NUMBER_ID and whatsapp.ACCESS_TOKEN:
+        result["whatsapp"] = {"configured": True}
+    else:
+        result["whatsapp"] = {"configured": False}
+
+    from adapters import discord_adapter
+    if discord_adapter.BOT_TOKEN and discord_adapter.CHANNEL_ID:
+        healthy = discord_adapter._bot_loop is not None and discord_adapter._bot_channel is not None
+        result["discord"] = {"configured": True, "healthy": healthy}
+    else:
+        result["discord"] = {"configured": False}
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -328,6 +376,7 @@ def status():
         "endpoint":     _llm.base_url if _llm else LLM_BASE_URL,
         "memory_count": mem_count,
         "pending":      pending,
+        "channels":     _channel_health(),
     }
 
 

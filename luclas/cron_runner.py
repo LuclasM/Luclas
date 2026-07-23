@@ -186,6 +186,121 @@ def _notify_discord(user_id: str, content: str) -> None:
         _log(f"discord notify: exception {e}")
 
 
+# ---------------------------------------------------------------------------
+# Active channel/LLM health checks + self-alerting
+#
+# Without this, a dead channel (e.g. an expired WeCom corp secret, or the
+# Discord bot silently failing to reconnect) is otherwise only discovered
+# when a user reports they stopped getting replies — there's no other signal
+# anywhere. This actively probes api.py's own /status (which api.py can
+# check cheaply/accurately since it holds the live connection objects — see
+# api.py:_channel_health) and pushes an alert to LUC_ADMIN_NOTIFY through the
+# same already-working channels, rather than requiring a new notification
+# system.
+# ---------------------------------------------------------------------------
+
+_HEALTH_CHECK_INTERVAL_MINUTES = 15
+_HEALTH_ALERT_COOLDOWN_HOURS   = 6   # don't re-alert for an already-known ongoing failure more often than this
+_HEALTH_STATE_FILE = os.path.join(DATA_DIR, "channel_health_state.json")
+
+
+def _load_health_state() -> dict:
+    import json as _json
+    try:
+        with open(_HEALTH_STATE_FILE) as f:
+            return _json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_health_state(state: dict) -> None:
+    import json as _json
+    try:
+        with open(_HEALTH_STATE_FILE, "w") as f:
+            _json.dump(state, f, indent=2)
+    except Exception as e:
+        _log(f"health state save failed: {e}")
+
+
+def _notify_admin(content: str) -> None:
+    """Send a health-check alert to LUC_ADMIN_NOTIFY — same "channel:id"
+    format as a schedule's notify_channel (e.g. "wecom:U123"). No-op if unset
+    (this whole feature is opt-in)."""
+    target = os.environ.get("LUC_ADMIN_NOTIFY", "").strip()
+    if not target:
+        return
+    if target.startswith("wecom:"):
+        _notify_wecom(target[len("wecom:"):], content)
+    elif target.startswith("whatsapp:"):
+        _notify_whatsapp(target[len("whatsapp:"):], content)
+    elif target.startswith("discord:"):
+        _notify_discord(target[len("discord:"):], content)
+    else:
+        _log(f"LUC_ADMIN_NOTIFY has an unrecognized format: {target!r} (expected wecom:/whatsapp:/discord:)")
+
+
+def _check_channel_health(now: datetime.datetime) -> None:
+    """Runs every _HEALTH_CHECK_INTERVAL_MINUTES minutes. A persisted state
+    file means a still-ongoing failure only re-alerts every
+    _HEALTH_ALERT_COOLDOWN_HOURS, not on every single check, while a fresh
+    failure or a recovery always alerts immediately."""
+    if not os.environ.get("LUC_ADMIN_NOTIFY", "").strip():
+        return  # opt-in — nothing configured to notify, nothing to check
+    if now.minute % _HEALTH_CHECK_INTERVAL_MINUTES != 0:
+        return
+
+    import urllib.request, json as _json
+    key = _load_api_key()
+    try:
+        req = urllib.request.Request(f"{_API_BASE}/status", headers={"X-API-Key": key})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            current = _json.loads(r.read())
+    except Exception as e:
+        # api.py itself being unreachable is exactly the kind of thing this
+        # is meant to catch — but there's nothing to notify *through* if the
+        # service that would carry the notification is the thing that's down,
+        # so just log it for now.
+        _log(f"health check: could not reach {_API_BASE}/status: {e}")
+        return
+
+    checks = {"llm": current.get("llm") == "online"}
+    for ch, info in (current.get("channels") or {}).items():
+        if info.get("configured") and "healthy" in info:
+            checks[ch] = info["healthy"]
+
+    state   = _load_health_state()
+    now_iso = now.isoformat()
+
+    for name, healthy in checks.items():
+        prev = state.get(name, {"healthy": True, "last_alert": ""})
+        if healthy:
+            if not prev["healthy"]:
+                _notify_admin(f"✅ Luclas: {name} is back up.")
+            state[name] = {"healthy": True, "last_alert": ""}
+            continue
+
+        just_broke  = prev["healthy"]
+        stale_alert = True
+        if prev.get("last_alert"):
+            try:
+                last_alert_dt = datetime.datetime.fromisoformat(prev["last_alert"])
+                stale_alert = (now - last_alert_dt).total_seconds() >= _HEALTH_ALERT_COOLDOWN_HOURS * 3600
+            except Exception:
+                stale_alert = True
+
+        if just_broke or stale_alert:
+            detail = (current.get("channels") or {}).get(name, {}).get("detail", "")
+            msg = f"⚠️ Luclas: {name} appears to be down."
+            if detail:
+                msg += f" ({detail})"
+            _notify_admin(msg)
+            state[name] = {"healthy": False, "last_alert": now_iso}
+        else:
+            state[name] = {"healthy": False, "last_alert": prev.get("last_alert", "")}
+
+    _save_health_state(state)
+
+
 def _submit_task(goal: str, notify_channel: str) -> str | None:
     """POST /chat to submit the task. Returns the task_id, or None if the
     submission itself failed (server down, network error, etc.) — the caller
@@ -564,6 +679,10 @@ def main():
     if not interactive:
         _check_reflection(now)
     _check_scheduled(now, skip_terminal_launch=interactive)
+    # Goes through the independent API service (a plain HTTP GET), same as
+    # channel-routed scheduled tasks — never skipped for an interactive
+    # session for the same reason those aren't.
+    _check_channel_health(now)
 
 
 if __name__ == "__main__":
