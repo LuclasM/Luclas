@@ -3,6 +3,45 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.2] - 2026-07-25
+
+### Changed
+- **Memory model**: replaced per-message task memory (every incoming
+  message treated as an independent task, with "what happened before"
+  reconstructed each time via keyword search over `task_records`) with a
+  persistent conversation per user/channel (`memory/conversation_store.py`).
+  A lightweight turn loop (`conversation_runner.py`) chats directly in that
+  conversation, dispatching real work to the existing `TaskRunner` via a
+  new `dispatch_task` tool — foreground ("watch it happen", replaces the
+  conversation with live progress) or background (conversation stays
+  responsive while it runs). Long-term memory is now split into episodes
+  (`memory/episode_store.py`, one per finished task or conversation
+  topic-segment) and lessons (`memory/store.py`, extended with
+  freshness/linked_episode_ids/granularity), sharing one importance/
+  freshness-driven compression algorithm (`memory/decay.py`) that
+  gradually downgrades and eventually forgets low-value entries — this
+  fully retires `task_records`' row-count-triggered three-tier system
+  (`memory/task_memory.py` deleted; existing rows migrated into episodes
+  automatically on first startup after upgrading). `cron_runner.py` runs
+  the slow, LLM-calling side of that compression once a day, separate
+  from the cheap per-turn context-window eviction that happens on every
+  conversation turn. The CLI's interactive session now uses one fixed,
+  durable conversation (`cli_local`) instead of a fresh one per process,
+  so it survives restarts.
+- The `/tasks`, `/history`, and `/log` CLI commands (which read
+  `task_records.tree`) are removed along with the table they depended on.
+
+### Fixed
+- Several lost-update races found in self-review of the above: concurrent
+  writes to a conversation's message history, and to an episode's/lesson's
+  reference-count-driven importance, could silently drop updates under
+  real concurrent usage (a background task's completion racing the
+  conversation's own next turn is the normal case, not an edge case).
+  Also fixed a regex bug where a reply merely mentioning the internal
+  topic-boundary tag format could get truncated and leak the literal tag,
+  and a CLI-only gap where a background task's result never made it into
+  conversation history (unlike the API path).
+
 ## [0.2.8] - 2026-07-17
 
 ### Changed
