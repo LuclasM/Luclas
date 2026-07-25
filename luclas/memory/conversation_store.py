@@ -13,6 +13,7 @@ memory/conversation_store.py — 持久对话本体
 
 import datetime
 import json
+import threading
 import uuid
 
 from memory.database import get_conn
@@ -22,6 +23,30 @@ TASK_EPISODE_TAG = "__task__"
 COMPRESS_TRIGGER_RATIO = 0.70
 COMPRESS_TARGET_RATIO = 0.50
 DEFAULT_CONTEXT_LENGTH = 8192
+
+# append_message()/close_topic()/evict_if_over_threshold() are all read-
+# modify-write on the same conversations.messages JSON blob (read the whole
+# row, mutate in Python, write the whole row back) — SQLite's own writer
+# serialization doesn't protect against that, since two threads can each
+# successfully SELECT before either UPDATEs. This is a real, not
+# theoretical, race in this codebase: a background dispatch_task result
+# (api.py's _bg()/luclas.py's _make_cli_dispatch _run()) can land at any
+# moment while a *different* conversation turn for the same conversation_id
+# is still mid-flight (that's the entire point of background dispatch —
+# the conversation stays responsive and keeps going while it runs), and
+# without this lock the loser's whole append is silently dropped. One lock
+# per conversation_id, mirroring tools/user_input.py's _lock_for_session.
+_locks_guard = threading.Lock()
+_conversation_locks: dict = {}
+
+
+def _lock_for(conversation_id: str) -> threading.Lock:
+    with _locks_guard:
+        lock = _conversation_locks.get(conversation_id)
+        if lock is None:
+            lock = threading.Lock()
+            _conversation_locks[conversation_id] = lock
+        return lock
 
 
 class ConversationStore:
@@ -44,14 +69,15 @@ class ConversationStore:
             }
 
     def append_message(self, conversation_id: str, role: str, content: str, episode_id: str = None) -> None:
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        conv = self.get_or_create(conversation_id)
-        tag = episode_id or conv["current_episode_id"]
-        messages = conv["messages"]
-        messages.append({"role": role, "content": content, "timestamp": now, "episode_id": tag})
-        with get_conn() as conn:
-            conn.execute("UPDATE conversations SET messages=?, updated_at=? WHERE id=?",
-                         (json.dumps(messages, ensure_ascii=False), now, conversation_id))
+        with _lock_for(conversation_id):
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conv = self.get_or_create(conversation_id)
+            tag = episode_id or conv["current_episode_id"]
+            messages = conv["messages"]
+            messages.append({"role": role, "content": content, "timestamp": now, "episode_id": tag})
+            with get_conn() as conn:
+                conn.execute("UPDATE conversations SET messages=?, updated_at=? WHERE id=?",
+                             (json.dumps(messages, ensure_ascii=False), now, conversation_id))
 
     def get_messages(self, conversation_id: str) -> list:
         return self.get_or_create(conversation_id)["messages"]
@@ -68,18 +94,19 @@ class ConversationStore:
         """Persist the currently-open topic-segment as an episode and start a
         fresh one. Returns the closed episode's id, or None if the segment
         had no messages yet (nothing to close)."""
-        conv = self.get_or_create(conversation_id)
-        current_id = conv["current_episode_id"]
-        segment = [m for m in conv["messages"] if m["episode_id"] == current_id]
-        if not segment:
-            return None
-        content = "\n".join(f"{m['role']}: {m['content']}" for m in segment)
-        episode_store.close_conversation_episode(current_id, conversation_id, content, importance=importance)
-        new_episode_id = uuid.uuid4().hex[:12]
-        with get_conn() as conn:
-            conn.execute("UPDATE conversations SET current_episode_id=? WHERE id=?",
-                         (new_episode_id, conversation_id))
-        return current_id
+        with _lock_for(conversation_id):
+            conv = self.get_or_create(conversation_id)
+            current_id = conv["current_episode_id"]
+            segment = [m for m in conv["messages"] if m["episode_id"] == current_id]
+            if not segment:
+                return None
+            content = "\n".join(f"{m['role']}: {m['content']}" for m in segment)
+            episode_store.close_conversation_episode(current_id, conversation_id, content, importance=importance)
+            new_episode_id = uuid.uuid4().hex[:12]
+            with get_conn() as conn:
+                conn.execute("UPDATE conversations SET current_episode_id=? WHERE id=?",
+                             (new_episode_id, conversation_id))
+            return current_id
 
     def evict_if_over_threshold(self, conversation_id: str, context_length: int = DEFAULT_CONTEXT_LENGTH) -> int:
         """Drop already-closed-episode turns from the live window once usage
@@ -87,36 +114,37 @@ class ConversationStore:
         belonging to the still-open topic (current_episode_id) are never
         evicted this way — only turns whose episode is already safely in
         the episodes table. Returns how many messages were evicted."""
-        conv = self.get_or_create(conversation_id)
-        messages = conv["messages"]
-        current_id = conv["current_episode_id"]
+        with _lock_for(conversation_id):
+            conv = self.get_or_create(conversation_id)
+            messages = conv["messages"]
+            current_id = conv["current_episode_id"]
 
-        def total_tokens(msgs):
-            return sum(estimate_tokens(m["content"]) for m in msgs)
+            def total_tokens(msgs):
+                return sum(estimate_tokens(m["content"]) for m in msgs)
 
-        used = total_tokens(messages)
-        if used < context_length * COMPRESS_TRIGGER_RATIO:
-            return 0
+            used = total_tokens(messages)
+            if used < context_length * COMPRESS_TRIGGER_RATIO:
+                return 0
 
-        target = context_length * COMPRESS_TARGET_RATIO
-        evicted = 0
-        i = 0
-        while i < len(messages) and used > target:
-            m = messages[i]
-            if m["episode_id"] == current_id:
-                i += 1
-                continue
-            used -= estimate_tokens(m["content"])
-            evicted += 1
-            del messages[i]
-            # don't advance i — the list shifted left under us
+            target = context_length * COMPRESS_TARGET_RATIO
+            evicted = 0
+            i = 0
+            while i < len(messages) and used > target:
+                m = messages[i]
+                if m["episode_id"] == current_id:
+                    i += 1
+                    continue
+                used -= estimate_tokens(m["content"])
+                evicted += 1
+                del messages[i]
+                # don't advance i — the list shifted left under us
 
-        if evicted:
-            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with get_conn() as conn:
-                conn.execute("UPDATE conversations SET messages=?, updated_at=? WHERE id=?",
-                             (json.dumps(messages, ensure_ascii=False), now, conversation_id))
-        return evicted
+            if evicted:
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with get_conn() as conn:
+                    conn.execute("UPDATE conversations SET messages=?, updated_at=? WHERE id=?",
+                                 (json.dumps(messages, ensure_ascii=False), now, conversation_id))
+            return evicted
 
     def _row(self, r) -> dict:
         return {

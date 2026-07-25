@@ -16,11 +16,28 @@ LLM 摘要调用，失败/被别的调用者抢先则原样释放。
 
 import datetime
 import json
+import threading
 import uuid
 
 from memory.database import get_conn
-from memory.decay import bump_importance
 import memory.decay as decay
+
+# link_lesson() is a read-modify-write on linked_lesson_ids (read the JSON
+# array, append in Python, write the whole array back) — the same class of
+# lost-update race conversation_store.py's lock addresses, just lower
+# frequency (once per AAR-linked task rather than per message). A per-
+# episode-id lock is cheap enough to just always take.
+_locks_guard = threading.Lock()
+_episode_locks: dict = {}
+
+
+def _lock_for(episode_id: str) -> threading.Lock:
+    with _locks_guard:
+        lock = _episode_locks.get(episode_id)
+        if lock is None:
+            lock = threading.Lock()
+            _episode_locks[episode_id] = lock
+        return lock
 
 
 class EpisodeStore:
@@ -50,28 +67,29 @@ class EpisodeStore:
         """A structural link (a lesson cites this episode) or a usage hit
         (retrieved and actually used) — both count as a reference. Bumps
         importance; freshness is deliberately untouched (episodes only decay
-        with time, see module docstring)."""
+        with time, see module docstring). The increment happens entirely in
+        SQL (not read-then-write in Python) so concurrent references to the
+        same popular episode (e.g. two conversations' memory_search calls
+        both hitting it) can't lose an increment to a lost-update race."""
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with get_conn() as conn:
-            row = conn.execute("SELECT importance FROM episodes WHERE id=?", (episode_id,)).fetchone()
-            if not row:
-                return
             conn.execute("""
                 UPDATE episodes
-                SET importance=?, reference_count=reference_count+1, last_referenced_at=?
+                SET importance=MIN(?, importance+1), reference_count=reference_count+1, last_referenced_at=?
                 WHERE id=?
-            """, (bump_importance(row["importance"]), now, episode_id))
+            """, (decay.MAX_IMPORTANCE, now, episode_id))
 
     def link_lesson(self, episode_id: str, lesson_id: str) -> None:
-        with get_conn() as conn:
-            row = conn.execute("SELECT linked_lesson_ids FROM episodes WHERE id=?", (episode_id,)).fetchone()
-            if not row:
-                return
-            ids = json.loads(row["linked_lesson_ids"] or "[]")
-            if lesson_id not in ids:
-                ids.append(lesson_id)
-            conn.execute("UPDATE episodes SET linked_lesson_ids=? WHERE id=?",
-                         (json.dumps(ids, ensure_ascii=False), episode_id))
+        with _lock_for(episode_id):
+            with get_conn() as conn:
+                row = conn.execute("SELECT linked_lesson_ids FROM episodes WHERE id=?", (episode_id,)).fetchone()
+                if not row:
+                    return
+                ids = json.loads(row["linked_lesson_ids"] or "[]")
+                if lesson_id not in ids:
+                    ids.append(lesson_id)
+                conn.execute("UPDATE episodes SET linked_lesson_ids=? WHERE id=?",
+                             (json.dumps(ids, ensure_ascii=False), episode_id))
 
     def get(self, episode_id: str) -> dict:
         with get_conn() as conn:

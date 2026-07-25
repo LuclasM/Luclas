@@ -69,6 +69,28 @@ _session_queues: dict[str, queue.Queue] = {}
 # session_id → task_id of the currently-running task
 _session_tasks: dict[str, str] = {}
 
+# Two messages to the *same* conversation can arrive close enough together
+# that /chat spawns two _run_conversation_turn threads before either has
+# appended anything (neither looks like an "active task" yet, so /chat's own
+# foreground-supplement check doesn't catch this) — without serializing them,
+# both turns would build their LLM prompt from the same stale snapshot and
+# reply out of order. This does NOT need to (and must not) span the whole
+# call chain including a background dispatch_task's own completion — that
+# already appends safely via memory/conversation_store.py's own per-
+# conversation lock — this is purely about not running two *whole turns*
+# for one conversation concurrently.
+_turn_locks_guard = threading.Lock()
+_turn_locks: dict[str, threading.Lock] = {}
+
+
+def _turn_lock_for(conversation_id: str) -> threading.Lock:
+    with _turn_locks_guard:
+        lock = _turn_locks.get(conversation_id)
+        if lock is None:
+            lock = threading.Lock()
+            _turn_locks[conversation_id] = lock
+        return lock
+
 
 @app.on_event("startup")
 def _startup() -> None:
@@ -305,11 +327,12 @@ def _dispatch_task_for_conversation(conversation_id: str, goal: str, foreground:
 def _run_conversation_turn(conversation_id: str, message: str) -> None:
     push = _make_push_callback(conversation_id)
     try:
-        reply, already_delivered = conversation_runner.handle_turn(
-            conversation_id, message, llm=_llm, mem_store=_store,
-            episode_store=_episodes, conv_store=_conversations,
-            dispatch_fn=_dispatch_task_for_conversation,
-        )
+        with _turn_lock_for(conversation_id):
+            reply, already_delivered = conversation_runner.handle_turn(
+                conversation_id, message, llm=_llm, mem_store=_store,
+                episode_store=_episodes, conv_store=_conversations,
+                dispatch_fn=_dispatch_task_for_conversation,
+            )
         if reply and not already_delivered and push:
             push(reply)
     except Exception as e:

@@ -68,3 +68,30 @@ def test_compress_due_no_double_processing_under_concurrency(isolated_db):
         f"the two concurrent calls' processed counts must add up to exactly the 10 rows that existed, "
         f"got A={results['A']} B={results['B']}"
     )
+
+
+def test_reference_no_lost_increments_under_concurrency(isolated_db):
+    """reference() bumps importance via UPDATE ... SET importance=MIN(?,
+    importance+1) entirely in SQL rather than SELECT-then-UPDATE in Python —
+    a popular episode (memory_search hits from more than one conversation
+    at once) must not lose increments to a lost-update race."""
+    store = EpisodeStore()
+    eid = store.create_task_episode("conv1", "task1", "some content", importance=1)
+
+    n = 30
+
+    def worker():
+        store.reference(eid)
+
+    threads = [threading.Thread(target=worker) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    row = store.get(eid)
+    assert row["reference_count"] == n, f"expected {n} references recorded, got {row['reference_count']}"
+    assert row["importance"] == decay.MAX_IMPORTANCE, (
+        f"{n} references from importance=1 should saturate at MAX_IMPORTANCE={decay.MAX_IMPORTANCE}, "
+        f"got {row['importance']} (a lost-update race would leave it short)"
+    )

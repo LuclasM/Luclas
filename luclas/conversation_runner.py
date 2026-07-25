@@ -28,7 +28,7 @@ from tools.registry import execute_tool
 
 CONVERSATION_MAX_ITERATIONS = 6
 
-_TOPIC_TAG_RE = re.compile(r'<topic>\s*(continue|new)\s*</topic>\s*$', re.IGNORECASE | re.MULTILINE)
+_TOPIC_TAG_RE = re.compile(r'<topic>\s*(continue|new)\s*</topic>\s*$', re.IGNORECASE)
 
 DISPATCH_TASK_SCHEMA = {
     "type": "function",
@@ -77,7 +77,14 @@ def _build_messages(raw_messages: list) -> list:
 
 
 def _strip_topic_tag(content: str) -> tuple:
-    """Returns (display_text, topic_changed)."""
+    """Returns (display_text, topic_changed). Deliberately no re.MULTILINE on
+    _TOPIC_TAG_RE — with it, `$` matches before every line break, so a reply
+    that merely *mentions* the tag format earlier (e.g. explaining it, or
+    just coincidentally similar text) would match there instead of at the
+    true trailing tag, truncating real reply content and leaking the actual
+    tag as visible text. Without it, `$` only matches the end of the whole
+    string (or just before one trailing newline), so this can only ever
+    match the genuinely final line."""
     m = _TOPIC_TAG_RE.search(content)
     if not m:
         return content.strip(), False

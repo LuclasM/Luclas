@@ -1,4 +1,4 @@
-__version__ = "0.2.22"
+__version__ = "0.2.23"
 
 import builtins
 import datetime
@@ -25,7 +25,7 @@ def _make_llm() -> LLMClient:
     return LLMClient(router=router)
 from memory.database import init_db
 from memory.store import MemoryStore
-from memory.conversation_store import ConversationStore
+from memory.conversation_store import ConversationStore, TASK_EPISODE_TAG
 from memory.episode_store import EpisodeStore
 from tools.registry import build_tools
 from tools.core_tools import load_core, core_update
@@ -236,7 +236,7 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
             mem_store=store, session_id=conversation_id,
         )
 
-        def _run() -> str:
+        def _run(record_in_history: bool) -> str:
             print(f"\n{head(T.task_started())}")
             try:
                 result = task_runner.run(goal, on_result=lambda r: print(f"\n{head(T.task_done())}\n{r}\n"))
@@ -249,13 +249,24 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
                 print()
             episode_store.create_task_episode(conversation_id, uuid.uuid4().hex[:12], result, importance=7)
             conv_store.clear_active_task(conversation_id)
+            if record_in_history:
+                # Background dispatch: handle_turn() already returned (its
+                # own reply was the immediate ack, e.g. "好的，我这就去处理"),
+                # so this result needs its own append to actually land in the
+                # conversation — unlike the foreground path, where handle_turn()
+                # is still on the call stack and appends reply_text itself
+                # once dispatch_fn() returns (see conversation_runner.py:
+                # already_delivered=True). Without this, a background task's
+                # outcome would only ever be visible in the printed terminal
+                # output, never recalled naturally in later conversation turns.
+                conv_store.append_message(conversation_id, "assistant", result, episode_id=TASK_EPISODE_TAG)
             return result
 
         task_id = uuid.uuid4().hex[:12]
         conv_store.set_active_task(conversation_id, task_id, foreground)
         if foreground:
-            return {"delivered": True, "result": _run()}
-        threading.Thread(target=_run, daemon=True).start()
+            return {"delivered": True, "result": _run(record_in_history=False)}
+        threading.Thread(target=_run, kwargs={"record_in_history": True}, daemon=True).start()
         return {"delivered": False, "started": True, "task_id": task_id}
 
     return dispatch
