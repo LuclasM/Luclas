@@ -1,4 +1,4 @@
-__version__ = "0.2.23"
+__version__ = "0.3.2"
 
 import builtins
 import datetime
