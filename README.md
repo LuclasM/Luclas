@@ -1,4 +1,4 @@
-# Luclas `v0.2.8`
+# Luclas `v0.3.2`
 
 [![CI](https://github.com/LuclasM/Luclas/actions/workflows/ci.yml/badge.svg)](https://github.com/LuclasM/Luclas/actions/workflows/ci.yml)
 
@@ -29,7 +29,7 @@ Because Luclas writes its own rules, it can go wrong in ways a static assistant 
 Practical safeguards:
 - Read `data/core.md` periodically. It's a plain-text file; you can edit it directly.
 - When Luclas does something wrong, say so explicitly — "that approach was wrong because X" is more useful than silence or a vague "try again".
-- Use `/history` to review what it's been doing and whether the patterns look right.
+- Use `/memory` to review what it's stored and whether the patterns look right.
 - Use `core.md` snapshots (`/core history`) to see how its rules have changed.
 
 ## How to get the most out of it
@@ -44,8 +44,8 @@ Luclas grows faster with real work than with test questions.
 ## Features
 
 - **Recursive task decomposition** — the LLM decides whether a goal needs subtasks, with no fixed depth limit.
-- **Long-term memory** — searchable SQLite store with tags, importance scores, semantic search (sentence-transformers + cosine similarity, keyword fallback), and per-entry **source/credibility** tracking (first-hand experience, user instruction, learning material, web, etc. — 1-10 confidence score) so retrieval can tell a verified fact from a guess.
-- **Episodic memory** — recent tasks injected into context; older ones archived; very old batches compressed into LLM-written summaries.
+- **Persistent conversation** — one durable conversation per user/channel (and one for the CLI), not a fresh context per message. Luclas chats directly in it and only hands real work off to task execution (in the foreground, replacing the conversation with live progress, or in the background, staying responsive) when the message actually calls for it.
+- **Long-term memory** — split into episodes (one per finished task or conversation topic) and lessons (facts/experience/opinions, with **source/credibility** tracking — first-hand experience, user instruction, learning material, web, etc., 1-10 confidence score), searchable via semantic search (sentence-transformers + cosine similarity, keyword fallback). Both share one importance/freshness-driven compression scheme that gradually condenses and eventually forgets low-value entries, instead of a fixed archive-then-summarize schedule.
 - **Multi-model routing** — configure several local/hosted models in `data/models.json` (`/models edit` for an interactive TUI manager) and Luclas classifies each task's complexity/type to route it to the right one, escalating to a stronger model on failure. Works with a single model too — this is entirely optional.
 - **Local LLM auto-detection** — setup scans for a running Ollama, LM Studio, or vLLM server on common local ports and offers it as a ready-to-use option, instead of requiring you to already know the base URL/port.
 - **Feedback loop** — after a task that's non-routine (first time doing something, mid-task errors, long-running, large/multi-step, or an open-ended result), Luclas asks how it went, saves the exchange as a memory, and — if you give it a corrected approach and confirm — redoes the task differently. Skipped automatically for simple, routine tasks.
@@ -92,7 +92,8 @@ luclas/
   luclas.py            CLI entry point, slash commands, bootstrap
   setup.py             interactive setup wizard (luclas setup)
   api.py               HTTP API (FastAPI)
-  cron_runner.py       scheduled task runner (crontab-driven)
+  cron_runner.py       scheduled task runner (crontab-driven) + daily memory compression
+  conversation_runner.py  persistent-conversation turn loop (chat vs. dispatch_task)
   config.py            env-driven configuration
   i18n.py              CLI display strings
   llm_client.py        OpenAI-compatible chat client
@@ -104,8 +105,10 @@ luclas/
     task_runner.py     recursive decompose/execute/merge, feedback loop
   memory/
     database.py        SQLite schema and migrations
-    store.py           long-term memory (source/credibility, semantic search)
-    task_memory.py     episodic task history
+    conversation_store.py  persistent per-user/channel conversation
+    episode_store.py   episodic memory (one per task or conversation topic)
+    store.py           lessons (source/credibility, semantic search)
+    decay.py           shared importance/freshness compression algorithm
   tools/               shell/python/file/search/http/web/memory/schedule tools
   adapters/
     dispatch.py        shared command/task routing used by all three below
