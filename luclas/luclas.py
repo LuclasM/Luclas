@@ -1,9 +1,10 @@
-__version__ = "0.3.6"
+__version__ = "0.3.4"
 
 import builtins
 import datetime
 import json
 import os
+import queue
 import re
 import readline
 import sys
@@ -29,6 +30,7 @@ from memory.conversation_store import ConversationStore, TASK_EPISODE_TAG
 from memory.episode_store import EpisodeStore
 from tools.registry import build_tools
 from tools.core_tools import load_core, core_update
+from tools.user_input import set_channel_context, clear_channel_context, has_pending_question
 from loops.task_runner import TaskRunner
 from utils.display import ok, err, warn, info, dim, head, bold
 import conversation_runner
@@ -39,6 +41,16 @@ import i18n as T
 # outside the conversation layer (see conversation_runner.py's module
 # docstring); only the interactive REPL below uses this.
 CLI_CONVERSATION_ID = "cli_local"
+
+# conversation_id -> the supplement_queue a background dispatch_task is
+# using, registered for the task's whole run (see _make_cli_dispatch).
+# main()'s REPL loop only actually routes a typed line here when
+# tools.user_input.has_pending_question() is also true (i.e. the task is
+# genuinely sitting in ask_user() right now) — mirrors api.py's /chat
+# routing for messaging channels; the rest of the time a typed line is a
+# normal new conversation turn, letting the user keep chatting about other
+# things while the background task runs quietly.
+_cli_pending_queues: dict = {}
 
 
 _ANSI_RE     = re.compile(r'\x1b\[[0-9;]*m')
@@ -202,6 +214,16 @@ def main():
                 raise
             continue
 
+        # A background dispatch_task is sitting in ask_user() right now —
+        # this line is the answer to that question, not a new conversation
+        # topic. Must be checked before _run_conversation_turn(), or the
+        # answer gets processed as an unrelated fresh turn while ask_user()
+        # just burns its timeout waiting on a queue nothing ever reaches.
+        pending_q = _cli_pending_queues.get(CLI_CONVERSATION_ID)
+        if pending_q is not None and has_pending_question(CLI_CONVERSATION_ID):
+            pending_q.put(line)
+            continue
+
         _run_conversation_turn(line, llm, store, episode_store, conv_store, dispatch_fn)
 
     _stop_print_logger()
@@ -228,15 +250,38 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
     dispatch thread while the main thread might also be mid-turn would hit
     the exact _model_queue/_current_idx race LLMClient.clone() exists to
     avoid (see llm_client.py), so each dispatch gets its own fresh
-    TaskRunner+LLMClient here instead, mirroring api.py's _run_task."""
+    TaskRunner+LLMClient here instead, mirroring api.py's _run_task.
+
+    Foreground dispatch runs synchronously on the main thread (nothing else
+    is reading stdin meanwhile), so its ask_user() can safely fall through
+    to a plain blocking input() — tools/user_input.py's tty branch, unchanged.
+    Background dispatch runs on its own thread while the main thread is
+    still sitting in its own input("LUC > ") call — without wiring a real
+    channel context here, ask_user() would *also* fall through to that same
+    tty branch and call input() from the background thread too: two threads
+    blocked reading the same stdin at once, an actual race, not just a
+    missed answer like the messaging-channel version of this bug. So
+    background dispatch gets a real push (prints to the terminal) and
+    wait_queue — registered in _cli_pending_queues so main()'s REPL loop can
+    route the next typed line there instead of starting a new conversation
+    turn, exactly like api.py's /chat does for a pending question.
+    """
     def dispatch(conversation_id: str, goal: str, foreground: bool) -> dict:
         task_llm = LLMClient(router=llm._router if llm else None)
+        q = queue.Queue()
         task_runner = TaskRunner(
             llm=task_llm, schemas=schemas, fns=fns,
             mem_store=store, session_id=conversation_id,
+            supplement_queue=q,
         )
 
         def _run(record_in_history: bool) -> str:
+            if record_in_history:
+                _cli_pending_queues[conversation_id] = q
+                set_channel_context(
+                    push=lambda msg: print(f"\n{warn(T.ask_user_label())} {msg}\n"),
+                    wait_queue=q, session_id=conversation_id,
+                )
             print(f"\n{head(T.task_started())}")
             try:
                 result = task_runner.run(goal, on_result=lambda r: print(f"\n{head(T.task_done())}\n{r}\n"))
@@ -247,6 +292,10 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
                 result = str(e)
                 print(err(T.task_exception(e)))
                 print()
+            finally:
+                if record_in_history:
+                    clear_channel_context()
+                    _cli_pending_queues.pop(conversation_id, None)
             episode_store.create_task_episode(conversation_id, uuid.uuid4().hex[:12], result, importance=7)
             conv_store.clear_active_task(conversation_id)
             if record_in_history:
