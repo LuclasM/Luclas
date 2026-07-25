@@ -203,12 +203,22 @@ def _make_push_callback(session_id: str):
 
 
 def _run_task(task_id: str, goal: str, session_id: str,
-              supplement_queue: "queue.Queue | None" = None) -> None:
+              supplement_queue: "queue.Queue | None" = None, show_progress: bool = True) -> None:
     from tools.user_input import _NeedUserInput, set_channel_context, clear_channel_context
     schemas, fns = build_tools(_store)
 
     push = _make_push_callback(session_id)
-    progress_callback = push  # same channel for progress and completion
+    # show_progress=False is how background dispatch_task (see
+    # _dispatch_task_for_conversation below) stays quiet mid-task — without
+    # this, every tool-call round trip pushes a "💭.../▶ tool_name" progress
+    # line to the channel regardless of foreground/background, which is
+    # exactly the live-process view "watch it happen" (foreground) is
+    # supposed to be, defeating the entire point of background dispatch
+    # ("stays quiet, conversation can continue, only the final answer
+    # lands"). on_result/failure pushes below are NOT gated by this — a
+    # background task still needs to actually tell the user when it's done
+    # or failed, just not narrate every step getting there.
+    progress_callback = push if show_progress else None
 
     # cron_runner.py submits under a "cron_"-prefixed session_id and delivers
     # the final result itself by separately polling /result and notifying
@@ -308,12 +318,12 @@ def _dispatch_task_for_conversation(conversation_id: str, goal: str, foreground:
         return result
 
     if foreground:
-        _run_task(task_id, goal, conversation_id, q)  # blocks — caller is already off the HTTP thread
+        _run_task(task_id, goal, conversation_id, q, show_progress=True)  # blocks — caller is already off the HTTP thread
         result = _finish()
         return {"delivered": True, "result": result}
 
     def _bg():
-        _run_task(task_id, goal, conversation_id, q)
+        _run_task(task_id, goal, conversation_id, q, show_progress=False)
         result = _finish()
         # _run_task already pushed `result` via its own on_result — only
         # record it into the conversation transcript here, don't push again.
