@@ -1,4 +1,4 @@
-__version__ = "0.2.21"
+__version__ = "0.2.22"
 
 import builtins
 import datetime
@@ -7,6 +7,7 @@ import os
 import re
 import readline
 import sys
+import threading
 import uuid
 
 from config import (CODE_DIR, BASE_DIR, DB_PATH, DATA_DIR, CORE_PATH, CORE_LOCAL_PATH, CORE_HIST, REFLECT_PATH,
@@ -24,12 +25,20 @@ def _make_llm() -> LLMClient:
     return LLMClient(router=router)
 from memory.database import init_db
 from memory.store import MemoryStore
-from memory.task_memory import TaskMemory
+from memory.conversation_store import ConversationStore
+from memory.episode_store import EpisodeStore
 from tools.registry import build_tools
 from tools.core_tools import load_core, core_update
 from loops.task_runner import TaskRunner
 from utils.display import ok, err, warn, info, dim, head, bold
+import conversation_runner
 import i18n as T
+
+# One fixed conversation regardless of which terminal/process connects — CLI
+# headless invocations (--run/--reflect, cron-launched terminal tasks) stay
+# outside the conversation layer (see conversation_runner.py's module
+# docstring); only the interactive REPL below uses this.
+CLI_CONVERSATION_ID = "cli_local"
 
 
 _ANSI_RE     = re.compile(r'\x1b\[[0-9;]*m')
@@ -85,24 +94,21 @@ def _run_headless(goal: str) -> None:
     # routine and can happen *while api.py is running as a persistent
     # service* (they're designed to coexist, not mutually exclusive like the
     # interactive CLI vs cron). _cleanup_interrupted_state() unconditionally
-    # marks every tier='running' task_records row as failed and deletes
-    # task_state memories — it can't tell "stale from a crash" apart from
-    # "genuinely in progress right now in api.py". Running it here would let
-    # a scheduled reminder or nightly reflection randomly clobber a live,
-    # unrelated in-progress task (e.g. a WeChat conversation) just from bad
-    # timing. Zombie cleanup for a genuinely-headless-only deployment (no
-    # interactive CLI, no api.py ever run) still happens eventually the next
-    # time either of those starts — a real but narrow gap, and strictly
-    # safer than the alternative.
+    # deletes task_state memories — it can't tell "stale from a crash" apart
+    # from "genuinely in progress right now in api.py". Running it here
+    # would let a scheduled reminder or nightly reflection randomly clobber
+    # a live, unrelated in-progress task (e.g. a WeChat conversation) just
+    # from bad timing. Zombie cleanup for a genuinely-headless-only
+    # deployment (no interactive CLI, no api.py ever run) still happens
+    # eventually the next time either of those starts — a real but narrow
+    # gap, and strictly safer than the alternative.
 
     session_id  = uuid.uuid4().hex[:8]
     llm         = _make_llm()
     store       = MemoryStore()
-    task_memory = TaskMemory()
     schemas, fns = build_tools(store)
     runner = TaskRunner(
         llm=llm, schemas=schemas, fns=fns,
-        task_memory=task_memory,
         mem_store=store, session_id=session_id,
     )
 
@@ -128,17 +134,19 @@ def main():
     _migrate_embeddings()
     _ensure_cron()
 
-    session_id  = uuid.uuid4().hex[:8]
+    session_id  = CLI_CONVERSATION_ID
     llm         = _make_llm()
     store       = MemoryStore()
-    task_memory = TaskMemory()
     schemas, fns = build_tools(store)
 
     runner = TaskRunner(
         llm=llm, schemas=schemas, fns=fns,
-        task_memory=task_memory,
         mem_store=store, session_id=session_id,
     )
+
+    conv_store    = ConversationStore()
+    episode_store = EpisodeStore()
+    dispatch_fn   = _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns)
 
     # 启动检查 core.md（core.local.md 存在则优先用它，不需要 bootstrap）
     if not os.path.isfile(CORE_PATH) and not os.path.isfile(CORE_LOCAL_PATH):
@@ -162,13 +170,7 @@ def main():
     print(f"  {dim(T.tips_line())}")
     print(f"\n{dim(T.startup_hint())}")
     avail = ok(T.online()) if llm.is_available() else err(T.offline())
-    tm_counts = task_memory.count()
-    n_running = tm_counts.get("running", 0)
-    running_label = f"  {warn(T.running_count(n_running))}" if n_running else ""
-    print(T.status_line(avail, store.count(), tm_counts['active'], tm_counts['archived'], running_label))
-    active = task_memory.get_running()
-    if active:
-        print(warn(T.unfinished_tasks(len(active))))
+    print(T.status_line(avail, store.count()))
     print(T.session_id_line(dim(session_id)))
     print()
 
@@ -192,7 +194,7 @@ def main():
 
         if line.startswith("/"):
             try:
-                _handle_slash(line, llm, store, task_memory, schemas, fns, runner)
+                _handle_slash(line, llm, store, schemas, fns, runner)
             except SystemExit:
                 readline.write_history_file(_history_file)
                 _stop_print_logger()
@@ -200,7 +202,7 @@ def main():
                 raise
             continue
 
-        _run_task(line, runner)
+        _run_conversation_turn(line, llm, store, episode_store, conv_store, dispatch_fn)
 
     _stop_print_logger()
     _remove_pid()
@@ -218,9 +220,66 @@ def _run_task(goal: str, runner: TaskRunner):
         print()
 
 
+def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
+    """dispatch_task's implementation for the CLI's persistent conversation.
+    Unlike api.py (a fresh TaskRunner+LLMClient per HTTP request already),
+    the CLI's main() keeps one shared TaskRunner/LLMClient alive for its
+    whole REPL session — reusing that same LLMClient from a background
+    dispatch thread while the main thread might also be mid-turn would hit
+    the exact _model_queue/_current_idx race LLMClient.clone() exists to
+    avoid (see llm_client.py), so each dispatch gets its own fresh
+    TaskRunner+LLMClient here instead, mirroring api.py's _run_task."""
+    def dispatch(conversation_id: str, goal: str, foreground: bool) -> dict:
+        task_llm = LLMClient(router=llm._router if llm else None)
+        task_runner = TaskRunner(
+            llm=task_llm, schemas=schemas, fns=fns,
+            mem_store=store, session_id=conversation_id,
+        )
+
+        def _run() -> str:
+            print(f"\n{head(T.task_started())}")
+            try:
+                result = task_runner.run(goal, on_result=lambda r: print(f"\n{head(T.task_done())}\n{r}\n"))
+            except KeyboardInterrupt:
+                result = T.task_interrupted()
+                print(result)
+            except Exception as e:
+                result = str(e)
+                print(err(T.task_exception(e)))
+                print()
+            episode_store.create_task_episode(conversation_id, uuid.uuid4().hex[:12], result, importance=7)
+            conv_store.clear_active_task(conversation_id)
+            return result
+
+        task_id = uuid.uuid4().hex[:12]
+        conv_store.set_active_task(conversation_id, task_id, foreground)
+        if foreground:
+            return {"delivered": True, "result": _run()}
+        threading.Thread(target=_run, daemon=True).start()
+        return {"delivered": False, "started": True, "task_id": task_id}
+
+    return dispatch
+
+
+def _run_conversation_turn(message: str, llm, store, episode_store, conv_store, dispatch_fn):
+    try:
+        reply, already_delivered = conversation_runner.handle_turn(
+            CLI_CONVERSATION_ID, message, llm=llm, mem_store=store,
+            episode_store=episode_store, conv_store=conv_store,
+            dispatch_fn=dispatch_fn,
+        )
+        if reply and not already_delivered:
+            print(f"\n{reply}\n")
+    except KeyboardInterrupt:
+        print(T.task_interrupted())
+    except Exception as e:
+        print(err(T.task_exception(e)))
+        print()
+
+
 # ── 斜杠命令 ──────────────────────────────────────────────
 
-def _handle_slash(line: str, llm, store, task_memory, schemas, fns, runner=None):
+def _handle_slash(line: str, llm, store, schemas, fns, runner=None):
     parts = line[1:].split(None, 2)
     cmd  = parts[0].lower() if parts else ""
     sub  = parts[1].lower() if len(parts) > 1 else ""
@@ -235,7 +294,7 @@ def _handle_slash(line: str, llm, store, task_memory, schemas, fns, runner=None)
         print(T.help_text())
 
     elif cmd == "status":
-        _show_status(store, task_memory)
+        _show_status(store)
 
     elif cmd == "whoami":
         _show_whoami(llm, store)
@@ -249,21 +308,8 @@ def _handle_slash(line: str, llm, store, task_memory, schemas, fns, runner=None)
         else:
             _memory_cmd("", store)
 
-    elif cmd == "tasks":
-        _show_tasks(task_memory)
-
-    elif cmd == "history":
-        _show_history(task_memory)
-
-    elif cmd == "log":
-        tid = sub or rest
-        if not tid:
-            print(err(T.log_usage()))
-        else:
-            _show_log(tid, task_memory)
-
     elif cmd == "reset":
-        _do_reset(store, task_memory)
+        _do_reset(store)
 
     elif cmd == "reflect":
         if runner is None:
@@ -295,14 +341,11 @@ def _handle_slash(line: str, llm, store, task_memory, schemas, fns, runner=None)
 
 # ── 命令实现 ──────────────────────────────────────────────
 
-def _show_status(store: MemoryStore, task_memory: TaskMemory):
+def _show_status(store: MemoryStore):
     print(f"\n{head(T.status_title())}")
     print(T.status_memory(store.count()))
-    tm = task_memory.count()
-    print(T.status_active_tasks(tm.get('running', 0)))
     snap_count = len(os.listdir(CORE_HIST)) if os.path.isdir(CORE_HIST) else 0
     print(T.status_policy_versions(snap_count))
-    print(T.status_history(tm['active'], tm.get('running', 0), tm['archived'], tm['summarized'], tm['summaries']))
     from llm_client import usage_summary
     u = usage_summary(days=1)
     print(T.status_token_usage(u["calls"], u["total_tokens"], u["all_time_calls"], u["all_time_total_tokens"]))
@@ -423,103 +466,7 @@ def _memory_cmd(sub: str, store: MemoryStore):
         print()
 
 
-def _show_tasks(task_memory: TaskMemory):
-    active = task_memory.get_running()
-    recent = task_memory.list_all(limit=15)
-    print(head(T.tasks_title()))
-    if active:
-        print(T.tasks_unfinished(len(active)))
-        for t in active:
-            print(f"  [{t['id']}] {warn('active')} {t['goal'][:60]}")
-        print()
-    print(T.tasks_recent())
-    for t in recent:
-        icon = {"done": ok("✓"), "failed": err("✗"), "running": warn("…")}.get(t.get("status", ""), "?")
-        print(f"  {icon} [{t['id']}] {t['goal'][:60]}")
-    print()
-
-
-def _show_history(task_memory: TaskMemory):
-    from memory.task_memory import _fmt_record, _fmt_tree_node, _tree_had_failure
-    summaries = task_memory.get_summaries()
-    records   = task_memory.list_all(limit=20)
-
-    print(head(T.history_title()))
-
-    if summaries:
-        print(info(T.history_summaries_label()))
-        for s in summaries:
-            period = f"({s['period_start']} ~ {s['period_end']})"
-            print(f"  {dim(period)}")
-            for line in s["content"].strip().splitlines():
-                print(f"    {line}")
-        print()
-
-    if records:
-        print(info(T.history_records_label()))
-        for r in records:
-            tier_label = {"active": ok("●"), "running": warn("▶"), "archived": dim("○"), "summarized": dim("·")}.get(r["tier"], " ")
-            print(f"  {tier_label} {_fmt_record(r)}")
-            if r.get("tree"):
-                try:
-                    tree = json.loads(r["tree"]) if isinstance(r["tree"], str) else r["tree"]
-                except Exception:
-                    tree = None
-                if tree:
-                    # 进行中任务：始终展开显示树
-                    # 已完成任务：只有出现过失败节点才展开（避免刷屏）
-                    had_failure = _tree_had_failure(tree)
-                    if r["tier"] == "running" or had_failure:
-                        if had_failure and r["tier"] != "running":
-                            print(f"      {warn(T.history_had_failure())}")
-                        lines = []
-                        _fmt_tree_node(tree, lines, 2)
-                        for line in lines:
-                            print(f"      {dim(line)}")
-    else:
-        print(T.history_empty())
-    print()
-
-
-def _show_log(tid: str, task_memory: TaskMemory):
-    from memory.task_memory import _fmt_tree_node, _collect_failed_nodes
-
-    record = task_memory.get(tid)
-    if not record:
-        print(err(T.log_not_found(tid)))
-        return
-
-    tree = None
-    if record.get("tree"):
-        try:
-            tree = json.loads(record["tree"]) if isinstance(record["tree"], str) else record["tree"]
-        except Exception:
-            tree = None
-
-    print(head(T.log_title(tid)))
-    print(T.log_goal(record['goal']))
-    print(T.log_status(record.get('status', '?')))
-    if tree and tree.get("result"):
-        print(T.log_result(tree['result'][:200]))
-    print()
-
-    if tree:
-        lines = []
-        _fmt_tree_node(tree, lines, 0)
-        print("\n".join(lines))
-
-        # 失败子任务的完整执行记录（工具调用/思考过程），按 exec_id 定位
-        for node in _collect_failed_nodes(tree):
-            exec_id = node.get("exec_id")
-            if not exec_id:
-                continue
-            msg_path = os.path.join(SESSION_DIR, "messages", f"{exec_id}.json")
-            if os.path.isfile(msg_path):
-                print(dim(T.log_failed_node_messages(node.get("goal", ""), msg_path)))
-    print()
-
-
-def _do_reset(store: MemoryStore, task_memory: TaskMemory):
+def _do_reset(store: MemoryStore):
     confirm = input(T.reset_confirm()).strip().lower()
     if confirm != "yes":
         print(T.reset_cancelled())
@@ -527,8 +474,8 @@ def _do_reset(store: MemoryStore, task_memory: TaskMemory):
     import sqlite3
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM memories")
-        conn.execute("DELETE FROM task_records")
-        conn.execute("DELETE FROM task_summaries")
+        conn.execute("DELETE FROM episodes")
+        conn.execute("DELETE FROM conversations")
     conn = sqlite3.connect(DB_PATH)
     conn.execute("VACUUM")
     conn.close()
@@ -701,16 +648,10 @@ def _start_print_logger():
 
 
 def _cleanup_interrupted_state() -> None:
-    """启动时清理上次崩溃留下的僵尸记录和过期任务状态记忆。"""
-    from memory.database import get_conn
+    """启动时清理上次崩溃留下的过期任务状态记忆（_write_mem 写的临时
+    "task_state" 记忆，正常结束会被 _cleanup_mem 删掉，只有崩溃/被杀掉的
+    进程才会遗留）。"""
     from memory.store import MemoryStore
-    with get_conn() as conn:
-        n = conn.execute(
-            "UPDATE task_records SET tier='active', status='failed', summary=? WHERE tier='running'",
-            (T.sentinel_abnormal_interrupt(),)
-        ).rowcount
-    if n:
-        print(warn(T.cleaned_interrupted_records(n)))
     mem = MemoryStore()
     stale = mem.search(type="task_state", limit=100)
     for m in stale:

@@ -8,10 +8,11 @@ run_agent 会话，跑完只把最终结果折叠回调用方——分支还可�
 深度超过软上限后每次再分支前要求 LLM 自我审查是否真的必要。
 决策永远基于已经发生的事实，而不是执行前一次性定死的计划。
 
-任务树（DB 里 task_records.tree 的 JSON 形状：{id, goal, status, result,
-subtasks, atomic}）刻意保持和旧的递归分解模型完全一样——分支现在是"发生了
-才记一笔"而不是"先规划出完整清单"，但落盘的树形状不变，/history、/tasks、
-/log 等既有渲染逻辑、旧的历史任务记录都不需要迁移。
+任务的整棵树只存在于这次调用的内存里（root dict：{id, goal, status, result,
+subtasks, atomic}），跑完就交给调用方（conversation_runner.py 的
+dispatch_task 分支）落成一条 episode——不再有单独的 task_records 表持久化
+执行过程中的每一步（那套三层记忆机制已经整个被持续对话层 + episodes/lessons
+取代，见 memory/conversation_store.py、memory/episode_store.py）。
 """
 
 import datetime
@@ -22,7 +23,6 @@ import uuid
 
 from loops.agent_loop import run_agent
 from loops._upgrade_eval import UpgradeEvaluator
-from memory.task_memory import TaskMemory, _tree_had_failure
 from tools.delegate import make_delegate_tool
 from tools.user_input import _NeedUserInput
 from utils.display import info, dim, ok, err, warn
@@ -52,18 +52,17 @@ def _node(goal: str) -> dict:
 class TaskRunner:
 
     def __init__(self, llm, schemas, fns,
-                 task_memory: TaskMemory, mem_store, session_id: str,
+                 mem_store, session_id: str,
                  progress_callback=None, supplement_queue=None):
         self.llm               = llm
         self.schemas           = schemas
         self.fns               = fns
-        self.task_memory       = task_memory
         self.mem_store         = mem_store
         self.session_id        = session_id
         self.progress_callback = progress_callback
         self.supplement_queue  = supplement_queue
         # P0-4: 升级触发机制 - 跟踪 root 任务完成情况
-        self._upgrade_evaluator = UpgradeEvaluator(self.llm, self.task_memory, self.mem_store)
+        self._upgrade_evaluator = UpgradeEvaluator(self.llm, self.mem_store)
         # Guards the tree-append + _save/_write_mem read-modify-write when
         # multiple delegate_subtask branches finish concurrently (parallel
         # dispatch — see loops/agent_loop.py). A single TaskRunner instance
@@ -79,19 +78,14 @@ class TaskRunner:
         display_goal = _strip_adapter_prefix(goal)   # clean goal for DB / display
         self.llm.set_goal(display_goal)              # classify without adapter noise
         root         = _node(goal)                   # full goal (with adapter context) for LLM
-        record_id   = uuid.uuid4().hex[:12]
         started     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mem_id      = [None]   # list 让分支闭包可以修改
         aar_mem_ids: list[str] = []   # 本次任务过程中写入的 AAR 经验记忆，供反馈附加
 
-        self._persist(record_id, root, "running", "", [], started, display_goal)
-
         try:
-            history_ctx = self.task_memory.build_context(goal)
-            self._run_root(root, record_id, started, history_ctx, mem_id, aar_mem_ids)
+            self._run_root(root, started, mem_id, aar_mem_ids)
         except KeyboardInterrupt:
             self._mark_interrupted(root)
-            self._persist(record_id, root, "active", T.sentinel_user_interrupted(), [], started, display_goal)
             self._cleanup_mem(mem_id)
             raise
         except _NeedUserInput as e:
@@ -100,30 +94,20 @@ class TaskRunner:
             # this one propagate instead of swallowing it into a generic "failed"
             # result, so the real caller (api.py:_run_task's own
             # `except _NeedUserInput`) gets a clean "needs input" signal instead
-            # of a garbled execution-error string — but we still need to persist
-            # the tree here first, or this record would be stuck at tier='running'
-            # forever (same failure mode as an unhandled crash).
+            # of a garbled execution-error string.
             if not root.get("result"):
                 root["result"] = T.sentinel_needs_input(e.question)
             self._mark_interrupted(root)
-            self._persist(record_id, root, "active", root["result"], [], started, display_goal)
             self._cleanup_mem(mem_id)
             raise
 
         final = root.get("result", T.sentinel_not_completed())
         if on_result:
             on_result(final)   # show the result to the user before asking for feedback
-        summary, artifacts = self._post_process(goal, final)
+        summary, _artifacts = self._post_process(goal, final)
         feedback_decision = self._maybe_collect_feedback(display_goal, summary, final, root, started, aar_mem_ids)
-        self._persist(record_id, root, "active", summary, artifacts, started, display_goal)
 
         self._cleanup_mem(mem_id)
-
-        archived = self.task_memory.archive_old()
-        if archived:
-            print(dim(T.archived_note(archived)))
-        if self.task_memory.maybe_compress(self.llm):
-            print(dim(T.compressed_note()))
 
         # P0-4: 任务完成后评估是否需要系统升级
         self._upgrade_evaluator.evaluate_after_task(goal, final)
@@ -137,15 +121,14 @@ class TaskRunner:
 
     # ── 主线程 ───────────────────────────────────────────
 
-    def _run_root(self, root: dict, record_id: str, started: str,
-                  history_ctx: str, mem_id: list, aar_mem_ids: list) -> None:
+    def _run_root(self, root: dict, started: str,
+                  mem_id: list, aar_mem_ids: list) -> None:
         """单条连续的主线程会话：一次 run_agent 贯穿整个任务，遇到值得独立
         处理的子任务时，LLM 自己调用 delegate_subtask 分支出去（_spawn_branch）。"""
         delegate_schema, delegate_fn = make_delegate_tool(
             lambda g, c="": self._spawn_branch(
                 root, g, c, ancestors=[], depth=0,
-                root=root, record_id=record_id, started=started,
-                mem_id=mem_id, aar_mem_ids=aar_mem_ids,
+                root=root, mem_id=mem_id, aar_mem_ids=aar_mem_ids,
             )
         )
         schemas = self.schemas + [delegate_schema]
@@ -156,13 +139,12 @@ class TaskRunner:
         root["exec_id"] = task["id"]
 
         root["status"] = "running"
-        self._save(record_id, root, started)
         mem_id[0] = self._write_mem(root, mem_id[0])
 
         try:
             result = run_agent(
                 root["goal"], task, self.llm, schemas, fns,
-                task_context=history_ctx,
+                task_context="",
                 progress_callback=self.progress_callback,
                 supplement_queue=self.supplement_queue,
             )
@@ -190,14 +172,13 @@ class TaskRunner:
             if aar_id:
                 aar_mem_ids.append(aar_id)
 
-        self._save(record_id, root, started)
         mem_id[0] = self._write_mem(root, mem_id[0])
 
     # ── 分支执行（delegate_subtask 的实际实现） ──────────
 
     def _spawn_branch(self, parent_node: dict, goal: str, context: str,
                       ancestors: list[str], depth: int,
-                      root: dict, record_id: str, started: str,
+                      root: dict,
                       mem_id: list, aar_mem_ids: list) -> str:
         """由 delegate_subtask 工具调用：校验 → 建子节点 → 跑一段独立、精炼
         上下文的嵌套 run_agent → 结果折叠回调用方（只返回最终文本）。
@@ -221,7 +202,6 @@ class TaskRunner:
         child = _node(goal)
         with self._branch_lock:
             parent_node.setdefault("subtasks", []).append(child)
-            self._save(record_id, root, started)
             mem_id[0] = self._write_mem(root, mem_id[0])
         print(f"{indent}{info('◈')} {T.branch_start_line(goal)}")
 
@@ -234,8 +214,7 @@ class TaskRunner:
         delegate_schema, delegate_fn = make_delegate_tool(
             lambda g, c="": self._spawn_branch(
                 child, g, c, ancestors=child_ancestors, depth=depth + 1,
-                root=root, record_id=record_id, started=started,
-                mem_id=mem_id, aar_mem_ids=aar_mem_ids,
+                root=root, mem_id=mem_id, aar_mem_ids=aar_mem_ids,
             )
         )
         schemas = self.schemas + [delegate_schema]
@@ -276,7 +255,6 @@ class TaskRunner:
         print(f"{indent}  {icon} {goal[:60]}")
 
         with self._branch_lock:
-            self._save(record_id, root, started)
             mem_id[0] = self._write_mem(root, mem_id[0])
 
         # P0-3: 分支完成后自动执行 AAR（跟原来 atomic 节点的 AAR 是同一套逻辑）
@@ -289,9 +267,10 @@ class TaskRunner:
     def _branch_context(self, goal: str, context: str, root: dict,
                         ancestors: list[str]) -> str:
         """精炼上下文：只给分支目标 + 调用方主动交代的事实 + 完整任务树（供
-        了解全局）+ 长期记忆检索结果——不拷贝调用方那条对话的原始思考/工具
-        调用记录，避免分支的 prompt 无限膨胀，也避免分支被调用方尚未确认的
-        中间猜测带偏。"""
+        了解全局）——不拷贝调用方那条对话的原始思考/工具调用记录，避免分支的
+        prompt 无限膨胀，也避免分支被调用方尚未确认的中间猜测带偏。长期记忆/
+        历史经历的检索留给 memory_search 工具按需调用（见
+        tools/memory_tools.py），不再在这里无条件注入。"""
         tree_str = self._tree_str_full(root)
         path     = " › ".join(ancestors + [goal]) if ancestors else goal
 
@@ -307,10 +286,6 @@ class TaskRunner:
             "given to you. Return a self-contained final answer — it is the only thing that flows "
             "back to the caller, so make it complete."
         )
-
-        fresh_ctx = self.task_memory.build_context(goal)
-        if fresh_ctx:
-            parts.append(fresh_ctx)
 
         return "\n\n".join(parts)
 
@@ -392,26 +367,11 @@ class TaskRunner:
         return None
 
     # ── 持久化 ───────────────────────────────────────────
-
-    def _persist(self, record_id: str, root: dict, tier: str,
-                 summary: str, artifacts: list, created_at: str,
-                 display_goal: str | None = None) -> None:
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.task_memory.save({
-            "id":           record_id,
-            "session_id":   self.session_id,
-            "goal":         display_goal or root["goal"],
-            "summary":      summary,
-            "artifacts":    artifacts,
-            "tree":         root,
-            "importance":   7,
-            "tier":         tier,
-            "created_at":   created_at,
-            "completed_at": now,
-        })
-
-    def _save(self, record_id: str, root: dict, started: str) -> None:
-        self._persist(record_id, root, "running", "", [], started)
+    # 任务树不再落 task_records（那张表已经整个退役）——调用方
+    # （conversation_runner.py 的 dispatch_task 分支）在 run() 返回后自己把
+    # 最终结果落成一条 episode。这里只留 _write_mem：跑动过程中把当前树写进
+    # mem_store 一条临时 "task_state" 记忆，供进程还活着时的实时状态查看，
+    # 任务结束 _cleanup_mem() 就删掉，跟 episodes/task_records 一直是两回事。
 
     def _write_mem(self, root: dict, existing_id: str | None) -> str:
         content = f"{T.current_task_tree_label()}\n{self._tree_str_full(root)}"
@@ -505,21 +465,17 @@ class TaskRunner:
         ).total_seconds()
         had_failure = _tree_had_failure(root)
         node_count  = self._count_nodes(root)
-        try:
-            first_time = not self.task_memory.get_relevant(goal, limit=1)
-        except Exception:
-            first_time = False
 
         prompt = (
             f"Task: {goal}\nResult: {final[:600]}\n\n"
             f"Signals: elapsed={elapsed:.0f}s, subtask_count={node_count}, "
-            f"had_failure_or_retry={had_failure}, first_time_similar_task={first_time}\n\n"
+            f"had_failure_or_retry={had_failure}\n\n"
             "Decide whether to ask the user for feedback on this result. Ask if ANY of: "
-            "this is the first time doing this kind of task, errors/retries happened mid-task, "
-            "it took a long time, it's a large/multi-step task, or the result is open-ended/"
-            "subjective — no single objectively correct answer, so the user's judgment matters "
-            "(writing, recommendations, creative work, ambiguous requests). Skip for simple, "
-            "routine, quick tasks with a clean, unambiguous, verifiable result.\n"
+            "errors/retries happened mid-task, it took a long time, it's a large/multi-step "
+            "task, or the result is open-ended/subjective — no single objectively correct "
+            "answer, so the user's judgment matters (writing, recommendations, creative work, "
+            "ambiguous requests). Skip for simple, routine, quick tasks with a clean, "
+            "unambiguous, verifiable result.\n"
             'Return JSON only: {"ask_feedback": true/false}'
         )
         try:
@@ -741,6 +697,15 @@ class TaskRunner:
 
 def _is_failed(result: str) -> bool:
     return any(result.startswith(p) for p in T.failed_prefixes())
+
+
+def _tree_had_failure(node: dict) -> bool:
+    """True if this node or any descendant ever ended in status='failed'."""
+    if not node:
+        return False
+    if node.get("status") == "failed":
+        return True
+    return any(_tree_had_failure(st) for st in node.get("subtasks", []))
 
 
 def _strip_adapter_prefix(goal: str) -> str:

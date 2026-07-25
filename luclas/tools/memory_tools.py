@@ -41,17 +41,24 @@ MEMORY_SEARCH_SCHEMA = {
     "type": "function",
     "function": {
         "name": "memory_search",
-        "description": "Search long-term memory. Supports keyword, type, and tag filtering.",
+        "description": (
+            "Search long-term memory: both lessons (experience/opinions/facts, "
+            "keyword+type+tag filterable) and episodes (past conversation topics "
+            "and finished tasks, keyword-searchable, returned alongside lessons "
+            "when a query is given). Each episode result's 'id' can be cited "
+            "directly in dispatch_task's episode_refs for a precise, non-fuzzy "
+            "reference instead of relying on this search."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query":          {"type": "string",  "description": "Search keyword"},
-                "type":           {"type": "string",  "description": "Filter by type"},
-                "tags":           {"type": "array",   "items": {"type": "string"}, "description": "Filter by tags"},
-                "min_importance":   {"type": "integer", "description": "Minimum importance filter"},
-                "source":           {"type": "string",  "description": "Filter by source"},
-                "min_credibility":  {"type": "integer", "description": "Minimum credibility filter (1-10 scale)"},
-                "limit":            {"type": "integer", "description": "Max number of results, default 20"},
+                "type":           {"type": "string",  "description": "Filter by type (lessons only)"},
+                "tags":           {"type": "array",   "items": {"type": "string"}, "description": "Filter by tags (lessons only)"},
+                "min_importance":   {"type": "integer", "description": "Minimum importance filter (lessons only)"},
+                "source":           {"type": "string",  "description": "Filter by source (lessons only)"},
+                "min_credibility":  {"type": "integer", "description": "Minimum credibility filter, 1-10 scale (lessons only)"},
+                "limit":            {"type": "integer", "description": "Max number of results per kind, default 20"},
             },
         },
     },
@@ -94,7 +101,7 @@ MEMORY_DELETE_SCHEMA = {
 }
 
 
-def make_memory_tools(store: MemoryStore):
+def make_memory_tools(store: MemoryStore, episode_store=None):
     schemas = [MEMORY_WRITE_SCHEMA, MEMORY_SEARCH_SCHEMA,
                MEMORY_UPDATE_SCHEMA, MEMORY_DELETE_SCHEMA]
 
@@ -110,7 +117,17 @@ def make_memory_tools(store: MemoryStore):
         results = store.search(query=query, type=type, tags=tags,
                                min_importance=min_importance, source=source,
                                min_credibility=min_credibility, limit=limit)
-        return {"count": len(results), "results": results}
+        out = {"count": len(results), "results": results}
+        # episode_store is only passed for the conversation layer (see
+        # conversation_runner.py) — task-execution's memory_search stays
+        # lessons-only, matching its pre-existing behavior.
+        if episode_store is not None:
+            episodes = episode_store.search(query=query, limit=limit)
+            for e in episodes:
+                episode_store.reference(e["id"])  # a search hit is a usage reference
+            out["episodes"] = episodes
+            out["count"] += len(episodes)
+        return out
 
     def memory_update(id: str, content: str = None, type: str = None,
                       tags: list = None, importance: int = None,

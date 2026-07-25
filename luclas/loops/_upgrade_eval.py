@@ -37,9 +37,8 @@ class UpgradeEvaluator:
     UPGRADE_THRESHOLD = 3  # 连续 N 个任务失败触发评估
     COOLDOWN_HOUR = 6  # 评估后冷却期（小时）
 
-    def __init__(self, llm, task_memory, mem_store):
+    def __init__(self, llm, mem_store):
         self.llm = llm
-        self.task_memory = task_memory
         self.mem_store = mem_store
         self._history = {}   # populated fresh, under _HISTORY_LOCK, in evaluate_after_task()
 

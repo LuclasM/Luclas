@@ -574,6 +574,46 @@ def _check_reflection(now: datetime.datetime) -> None:
         _log(f"nightly reflection skipped (idle only {idle:.1f}h)")
 
 
+# Long-term forgetting: memory/decay.py's shared claim-then-compress pass
+# (downgrade granularity raw->summary->gist, delete once already at gist),
+# for the lowest importance+freshness episodes/lessons across the whole DB.
+# This is deliberately decoupled from the conversation hot path — every
+# conversation turn already does its own cheap, no-LLM-call eviction (see
+# memory/conversation_store.py::evict_if_over_threshold, which just moves
+# already-closed-episode turns out of the live window); this is the slower,
+# LLM-calling kind that actually shrinks/forgets long-term storage, so it
+# runs once a day instead. Offset 30 minutes from the nightly reflection
+# (also 4am) so the two don't compete for the same minute.
+#
+# Calls compress_due() exactly once per store per day, not looped to
+# convergence — compress_due() has no memory of what it already touched
+# *this call*, so a "keep calling until it returns 0" loop would cascade the
+# same handful of rows straight through raw->summary->gist->deleted in one
+# run instead of one granularity step per day (the whole point: a row should
+# only fully disappear after staying unreferenced across several actual
+# days, not one enthusiastic cron tick).
+def _run_memory_compression(now: datetime.datetime) -> None:
+    if now.hour != 4 or now.minute != 30:
+        return
+    if not os.path.isfile(DB_PATH):
+        return
+    from llm_client import LLMClient
+    from llm_router import ModelRouter, load_models
+    from memory.episode_store import EpisodeStore
+    from memory.store import MemoryStore
+    from config import MODELS_CONFIG_PATH
+
+    models = load_models(MODELS_CONFIG_PATH)
+    router = ModelRouter(models) if models else None
+    llm = LLMClient(router=router)
+
+    episodes = EpisodeStore()
+    lessons  = MemoryStore()
+    total = episodes.compress_due(llm) + lessons.compress_due(llm)
+    if total:
+        _log(f"long-term memory compression: processed {total} episode/lesson row(s)")
+
+
 def _check_scheduled(now: datetime.datetime, skip_terminal_launch: bool = False) -> None:
     """skip_terminal_launch: True when an interactive CLI session is running
     (see main()) — only schedules with no notify_channel (which would launch
@@ -717,6 +757,11 @@ def main():
     # channel-routed scheduled tasks — never skipped for an interactive
     # session for the same reason those aren't.
     _check_channel_health(now)
+    # Only touches the DB (WAL + busy_timeout, plus its own claim-based
+    # concurrency safety — see memory/decay.py) and makes its own LLM calls
+    # directly, no PID/terminal contention with an interactive session —
+    # never skipped for the same reason _check_channel_health isn't.
+    _run_memory_compression(now)
 
 
 if __name__ == "__main__":

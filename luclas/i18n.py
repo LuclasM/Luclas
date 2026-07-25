@@ -32,10 +32,6 @@ def sentinel_user_interrupted() -> str:
     return _pick("(interrupted by user)", "（用户中断）")
 
 
-def sentinel_abnormal_interrupt() -> str:
-    return _pick("(abnormally interrupted)", "（异常中断）")
-
-
 def sentinel_not_completed() -> str:
     return _pick("(not completed)", "（未完成）")
 
@@ -151,15 +147,12 @@ def help_text() -> str:
   /core history <file>    View a historical version
   /memory                 View memory (latest 30)
   /memory search <kw>     Search memory
-  /tasks                  View task records
-  /history                View work history (latest 20 task records)
-  /log <task_id>          View task execution log
   /models                 Show configured LLM models
   /models edit            Interactive model manager (add/edit/delete)
   /reflect                Full strategic reflection — improves core.md methodology
   /schedule               Manage scheduled tasks
   /api restart            Restart the background API service (messaging adapters)
-  /reset                  Clear all memory and tasks (requires confirmation)
+  /reset                  Clear all memory and conversation history (requires confirmation)
   /q  /quit               Quit
 """,
         """
@@ -173,15 +166,12 @@ def help_text() -> str:
   /core history <文件名>  查看某个历史版本
   /memory                 查看记忆（最新 30 条）
   /memory search <词>     搜索记忆
-  /tasks                  查看任务记录
-  /history                查看工作历史（最近 20 条任务记录）
-  /log <task_id>          查看任务执行日志
   /models                 查看已配置的大模型
   /models edit            交互式模型管理（增删改，上下箭头导航）
   /reflect                全面反思，改进 core.md 方法论
   /schedule               管理定时任务
   /api restart            重启后台 API 服务（消息平台走的是这个）
-  /reset                  清除所有记忆和任务（需确认）
+  /reset                  清除所有记忆和对话历史（需确认）
   /q  /quit               退出
 """,
     )
@@ -290,19 +280,11 @@ def offline() -> str:
     return _pick("offline", "离线")
 
 
-def running_count(n: int) -> str:
-    return _pick(f"in progress {n}", f"进行中 {n} 个任务")
-
-
-def status_line(llm_avail: str, mem_count: int, active: int, archived: int, running_label: str) -> str:
+def status_line(llm_avail: str, mem_count: int) -> str:
     return _pick(
-        f"  LLM: {llm_avail}   memory: {mem_count}   history: {active} active / {archived} archived{running_label}",
-        f"  LLM：{llm_avail}   记忆：{mem_count} 条   历史：{active} 活跃 / {archived} 归档{running_label}",
+        f"  LLM: {llm_avail}   memory: {mem_count}",
+        f"  LLM：{llm_avail}   记忆：{mem_count} 条",
     )
-
-
-def unfinished_tasks(n: int) -> str:
-    return _pick(f"  {n} unfinished task(s), see /tasks", f"  有 {n} 个未完成任务，/tasks 查看")
 
 
 def session_id_line(sid: str) -> str:
@@ -335,10 +317,6 @@ def task_exception(e) -> str:
 
 def unknown_command(cmd: str) -> str:
     return _pick(f"Unknown command: /{cmd}  type /help for help", f"未知命令：/{cmd}  输入 /help 查看帮助")
-
-
-def log_usage() -> str:
-    return _pick("✗ usage: /log <task_id>", "✗ 用法：/log <task_id>")
 
 
 def api_usage() -> str:
@@ -374,20 +352,8 @@ def status_memory(n: int) -> str:
     return _pick(f"  Memory:        {n}", f"  记忆：      {n} 条")
 
 
-def status_active_tasks(n: int) -> str:
-    return _pick(f"  Active tasks:  {n}", f"  活跃任务：  {n} 个")
-
-
 def status_policy_versions(n: int) -> str:
     return _pick(f"  Policy versions: current + {n} snapshot(s)", f"  策略版本：  当前 + {n} 个历史快照")
-
-
-def status_history(active, running, archived, summarized, summaries) -> str:
-    return _pick(
-        f"  Work history:  active {active} | running {running} | archived {archived} | "
-        f"summarized {summarized} | {summaries} summary block(s)",
-        f"  工作历史：  活跃 {active} | 进行中 {running} | 归档 {archived} | 压缩 {summarized} | 摘要 {summaries} 段",
-    )
 
 
 def status_token_usage(calls: int, total_tokens: int, all_time_calls: int, all_time_total_tokens: int) -> str:
@@ -493,65 +459,6 @@ def memory_store_title(n: int, stats: str) -> str:
 
 # ── /tasks /history /log ────────────────────────────────────────────────────
 
-def tasks_title() -> str:
-    return _pick("\nTask records\n", "\n任务记录\n")
-
-
-def tasks_unfinished(n: int) -> str:
-    return _pick(f"Unfinished ({n}):", f"未完成（{n} 个）：")
-
-def tasks_recent() -> str:
-    return _pick("Recent:", "最近记录：")
-
-
-def history_title() -> str:
-    return _pick("\nWork history\n", "\n工作历史\n")
-
-
-def history_summaries_label() -> str:
-    return _pick("【Summaries】", "【历史摘要】")
-
-
-def history_records_label() -> str:
-    return _pick("【Task records】", "【任务记录】")
-
-
-def history_empty() -> str:
-    return _pick("  (no task records yet)", "  （暂无任务记录）")
-
-
-def history_had_failure() -> str:
-    return _pick("⚠ one or more subtasks failed during execution:",
-                 "⚠ 执行过程中有子任务失败过：")
-
-
-def log_not_found(tid: str) -> str:
-    return _pick(f"✗ task not found: {tid}", f"✗ 未找到任务：{tid}")
-
-
-def log_title(tid: str) -> str:
-    return _pick(f"\nTask log [{tid}]", f"\n任务日志 [{tid}]")
-
-
-def log_goal(v) -> str:
-    return _pick(f"  Goal:   {v}", f"  目标：{v}")
-
-
-def log_status(v) -> str:
-    return _pick(f"  Status: {v}", f"  状态：{v}")
-
-
-def log_result(v) -> str:
-    return _pick(f"  Result: {v}", f"  结果：{v}")
-
-
-def log_failed_node_messages(goal: str, p: str) -> str:
-    return _pick(
-        f"\nFailed subtask \"{goal[:50]}\" — full tool-call log: {p}",
-        f"\n失败子任务「{goal[:50]}」的完整执行记录：{p}",
-    )
-
-
 # ── /reset ───────────────────────────────────────────────────────────────────
 
 def reset_confirm() -> str:
@@ -581,10 +488,6 @@ def core_generate_failed(e) -> str:
 
 # ── startup cleanup / migration ──────────────────────────────────────────────
 
-def cleaned_interrupted_records(n: int) -> str:
-    return _pick(f"  ⚠ cleaned up {n} interrupted task record(s)", f"  ⚠ 已清理 {n} 条异常中断的任务记录")
-
-
 def cleaned_stale_memories(n: int) -> str:
     return _pick(f"  ⚠ cleaned up {n} stale task-state memory record(s)", f"  ⚠ 已清理 {n} 条过期任务状态记忆")
 
@@ -603,14 +506,6 @@ def log_saved(path: str) -> str:
 
 
 # ── task_runner.py ───────────────────────────────────────────────────────────
-
-def archived_note(n: int) -> str:
-    return _pick(f"  (archived {n} task record(s))", f"  （任务记录归档 {n} 条）")
-
-
-def compressed_note() -> str:
-    return _pick("  (history compressed)", "  （历史记录已压缩）")
-
 
 def branch_start_line(goal: str) -> str:
     return _pick(f"branch: {goal}", f"分支：{goal}")
@@ -733,34 +628,6 @@ def more_chars(n: int) -> str:
 
 
 # ── task_memory.py: build_context labels (shared by LLM context + /history) ─
-
-def work_history_header() -> str:
-    return _pick("=== Work History ===", "=== 工作历史 ===")
-
-
-def running_tasks_label() -> str:
-    return _pick("\n[Tasks in progress]", "\n【进行中任务】")
-
-
-def goal_label(v: str) -> str:
-    return _pick(f"Goal: {v}", f"目标：{v}")
-
-
-def summaries_label() -> str:
-    return _pick("\n[Summaries]", "\n【历史摘要】")
-
-
-def recent_tasks_label() -> str:
-    return _pick("\n[Recent tasks]", "\n【最近任务】")
-
-
-def relevant_history_label() -> str:
-    return _pick("\n[Relevant history]", "\n【当前相关历史】")
-
-
-def artifacts_label() -> str:
-    return _pick(" | artifacts: ", " | 产出: ")
-
 
 # ── adapters/dispatch.py: unified messaging-channel replies ─────────────────
 # Shared across wecom/whatsapp/discord so every channel respects LUC_LANG

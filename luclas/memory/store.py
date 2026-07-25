@@ -1,14 +1,24 @@
 import json
 import uuid
 from memory.database import get_conn
+from memory.decay import bump_importance
+import memory.decay as decay
+
+# "经验"（lessons）: unlike episodes, freshness refreshes to full on every
+# reference (see search()'s access-bump below) instead of only decaying
+# with time — that asymmetry is the whole point of keeping episodes and
+# lessons as separate concepts. See memory/episode_store.py's docstring for
+# the episode side and memory/decay.py for the shared compression algorithm.
 
 
 class MemoryStore:
 
     def write(self, content: str, type: str = "", tags: list = None,
-              importance: int = 5, source: str = "", credibility: int = 0) -> str:
+              importance: int = 5, source: str = "", credibility: int = 0,
+              linked_episode_ids: list = None) -> str:
         mid = uuid.uuid4().hex[:12]
         tags_json = json.dumps(tags or [], ensure_ascii=False)
+        linked_json = json.dumps(linked_episode_ids or [], ensure_ascii=False)
         try:
             from memory.embedder import encode
             emb = encode(content)
@@ -16,9 +26,9 @@ class MemoryStore:
             emb = None
         with get_conn() as conn:
             conn.execute(
-                "INSERT INTO memories (id,content,type,tags,importance,source,credibility,embedding) "
-                "VALUES (?,?,?,?,?,?,?,?)",
-                (mid, content, type, tags_json, importance, source, credibility, emb)
+                "INSERT INTO memories (id,content,type,tags,importance,source,credibility,embedding,linked_episode_ids) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (mid, content, type, tags_json, importance, source, credibility, emb, linked_json)
             )
         return mid
 
@@ -78,12 +88,42 @@ class MemoryStore:
             ids = [r[0] for r in rows]
             placeholders = ",".join("?" * len(ids))
             with get_conn() as conn:
-                conn.execute(
-                    f"UPDATE memories SET access_count = access_count + 1 WHERE id IN ({placeholders})",
-                    ids
-                )
+                # A search hit is a reference: importance rises (capped at
+                # 10, per-row since bump_importance isn't linear-safe to do
+                # in raw SQL) and freshness resets to full via updated_at —
+                # this is what makes a repeatedly-cited lesson stay "alive"
+                # indefinitely while an unused one decays toward compression.
+                current = conn.execute(
+                    f"SELECT id, importance FROM memories WHERE id IN ({placeholders})", ids
+                ).fetchall()
+                for r in current:
+                    conn.execute(
+                        "UPDATE memories SET access_count = access_count + 1, importance = ?, "
+                        "freshness = 1.0, updated_at = datetime('now','localtime') WHERE id=?",
+                        (bump_importance(r["importance"]), r["id"]),
+                    )
 
         return [self._row(r) for r in rows]
+
+    def link_episode(self, mid: str, episode_id: str) -> None:
+        with get_conn() as conn:
+            row = conn.execute("SELECT linked_episode_ids FROM memories WHERE id=?", (mid,)).fetchone()
+            if not row:
+                return
+            ids = json.loads(row["linked_episode_ids"] or "[]")
+            if episode_id not in ids:
+                ids.append(episode_id)
+            conn.execute("UPDATE memories SET linked_episode_ids=? WHERE id=?",
+                         (json.dumps(ids, ensure_ascii=False), mid))
+
+    def compress_due(self, llm) -> int:
+        """Claim the lowest importance+freshness batch of lessons and
+        downgrade each one granularity level (raw->summary->gist), or
+        delete rows already at the coarsest level. Lessons' freshness
+        decays from updated_at, which search() above refreshes on every
+        reference — the opposite of episodes. Returns how many rows were
+        actually processed (downgraded or deleted)."""
+        return decay.compress_due(llm, table="memories", timestamp_column="updated_at")
 
     def get(self, mid: str) -> dict | None:
         with get_conn() as conn:
@@ -160,4 +200,8 @@ class MemoryStore:
             d["tags"] = json.loads(d.get("tags") or "[]")
         except Exception:
             d["tags"] = []
+        try:
+            d["linked_episode_ids"] = json.loads(d.get("linked_episode_ids") or "[]")
+        except Exception:
+            d["linked_episode_ids"] = []
         return d

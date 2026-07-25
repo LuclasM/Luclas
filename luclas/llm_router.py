@@ -50,6 +50,7 @@ class ModelConfig:
     complexity: str                      # "low" | "mid" | "high"
     task_types: list[str] = field(default_factory=lambda: ["general"])
     classifier: bool = False             # use this model for task classification
+    context_length: int = 8192           # token budget the conversation layer compresses against
 
     @property
     def headers(self) -> dict:
@@ -76,6 +77,7 @@ def load_models(path: str) -> list[ModelConfig]:
                 complexity = item.get("complexity", "mid"),
                 task_types = item.get("task_types", ["general"]),
                 classifier = bool(item.get("classifier", False)),
+                context_length = int(item.get("context_length", 8192)),
             ))
         return models
     except Exception as e:

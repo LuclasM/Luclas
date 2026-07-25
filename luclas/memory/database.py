@@ -22,29 +22,6 @@ def init_db():
                 updated_at  TEXT DEFAULT (datetime('now','localtime'))
             );
 
-            CREATE TABLE IF NOT EXISTS task_records (
-                id           TEXT PRIMARY KEY,
-                session_id   TEXT DEFAULT '',
-                goal         TEXT NOT NULL,
-                summary      TEXT DEFAULT '',
-                artifacts    TEXT DEFAULT '[]',
-                tree         TEXT DEFAULT '{}',
-                importance   INTEGER DEFAULT 7,
-                tier         TEXT DEFAULT 'active',
-                status       TEXT DEFAULT 'running',
-                created_at   TEXT DEFAULT (datetime('now','localtime')),
-                completed_at TEXT DEFAULT (datetime('now','localtime'))
-            );
-
-            CREATE TABLE IF NOT EXISTS task_summaries (
-                id           TEXT PRIMARY KEY,
-                content      TEXT NOT NULL,
-                period_start TEXT DEFAULT '',
-                period_end   TEXT DEFAULT '',
-                record_ids   TEXT DEFAULT '[]',
-                created_at   TEXT DEFAULT (datetime('now','localtime'))
-            );
-
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
                 id            TEXT PRIMARY KEY,
                 name          TEXT NOT NULL,
@@ -74,9 +51,8 @@ def init_db():
             -- was previously no visibility into token usage at all, even
             -- though every OpenAI-compatible response already carries a
             -- `usage` field that was just being discarded. Rows are tiny and
-            -- not pruned/archived (unlike task_records) — even heavy daily
-            -- use keeps this table small for a long time; revisit if that
-            -- stops being true.
+            -- not pruned/archived — even heavy daily use keeps this table
+            -- small for a long time; revisit if that stops being true.
             CREATE TABLE IF NOT EXISTS llm_usage (
                 id                 TEXT PRIMARY KEY,
                 model              TEXT DEFAULT '',
@@ -86,6 +62,46 @@ def init_db():
                 created_at         TEXT DEFAULT (datetime('now','localtime'))
             );
             CREATE INDEX IF NOT EXISTS idx_llm_usage_created_at ON llm_usage(created_at);
+
+            -- Persistent per-user/per-channel conversation. One row per
+            -- conversation_id (channel-derived, e.g. "wecom_<UserID>", or the
+            -- fixed "cli_local" for the interactive CLI). `messages` is the
+            -- live/active-window transcript as a JSON array; older turns move
+            -- out into `episodes` once they've been closed out (topic
+            -- changed) and the window gets too big, not deleted.
+            CREATE TABLE IF NOT EXISTS conversations (
+                id                     TEXT PRIMARY KEY,
+                messages               TEXT DEFAULT '[]',
+                current_episode_id     TEXT DEFAULT '',
+                active_task_id         TEXT DEFAULT '',
+                active_task_foreground INTEGER DEFAULT 0,
+                created_at             TEXT DEFAULT (datetime('now','localtime')),
+                updated_at             TEXT DEFAULT (datetime('now','localtime'))
+            );
+
+            -- Episodic memory ("经历"): either one finished task execution
+            -- (kind='task', task_id set) or one topic-segment of a
+            -- conversation (kind='conversation'). Replaces task_records.
+            -- importance rises on every reference; freshness only decays
+            -- with time and is never refreshed by a reference (unlike
+            -- lessons in `memories` — see the freshness/linked_episode_ids/
+            -- granularity columns added there in _migrate()).
+            CREATE TABLE IF NOT EXISTS episodes (
+                id                 TEXT PRIMARY KEY,
+                conversation_id    TEXT DEFAULT '',
+                kind               TEXT DEFAULT 'conversation',
+                task_id            TEXT DEFAULT '',
+                content            TEXT NOT NULL,
+                granularity        TEXT DEFAULT 'raw',
+                importance         INTEGER DEFAULT 5,
+                freshness          REAL DEFAULT 1.0,
+                reference_count    INTEGER DEFAULT 0,
+                linked_lesson_ids  TEXT DEFAULT '[]',
+                created_at         TEXT DEFAULT (datetime('now','localtime')),
+                last_referenced_at TEXT DEFAULT (datetime('now','localtime'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_episodes_conversation ON episodes(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_episodes_compress_rank ON episodes(granularity, importance, freshness);
         """)
     _migrate()
 
@@ -171,33 +187,102 @@ def _migrate():
         except Exception:
             pass
 
-        # task_records.status: added when the redundant `tasks` table was folded
-        # into task_records. Backfill from each record's tree (root node status)
-        # before dropping `tasks`, so nothing is lost.
-        try:
-            # No DEFAULT here on purpose: existing rows must land as NULL so the
-            # backfill below (not SQLite's own default-fill) decides their status.
-            conn.execute("ALTER TABLE task_records ADD COLUMN status TEXT")
-        except Exception:
-            pass
-        try:
-            import json as _json
-            rows = conn.execute(
-                "SELECT id, tree FROM task_records WHERE status IS NULL OR status=''"
-            ).fetchall()
-            for r in rows:
-                try:
-                    tree = _json.loads(r["tree"] or "{}")
-                except Exception:
-                    tree = {}
-                status = tree.get("status") or "done"
-                if status not in ("done", "failed"):
-                    status = "done"
-                conn.execute("UPDATE task_records SET status=? WHERE id=?", (status, r["id"]))
-        except Exception:
-            pass
         try:
             conn.execute("DROP TABLE IF EXISTS tasks")
+        except Exception:
+            pass
+
+        # Persistent conversation layer (episodes/lessons memory redesign):
+        # conversations + episodes are new tables; memories gains freshness/
+        # linked_episode_ids/granularity so lessons ("经验") share the same
+        # importance/freshness/granularity compression scheme as episodes
+        # ("经历"). See memory/decay.py for the shared compression logic.
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id                     TEXT PRIMARY KEY,
+                    messages               TEXT DEFAULT '[]',
+                    current_episode_id     TEXT DEFAULT '',
+                    active_task_id         TEXT DEFAULT '',
+                    active_task_foreground INTEGER DEFAULT 0,
+                    created_at             TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at             TEXT DEFAULT (datetime('now','localtime'))
+                );
+            """)
+        except Exception:
+            pass
+        try:
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS episodes (
+                    id                 TEXT PRIMARY KEY,
+                    conversation_id    TEXT DEFAULT '',
+                    kind               TEXT DEFAULT 'conversation',
+                    task_id            TEXT DEFAULT '',
+                    content            TEXT NOT NULL,
+                    granularity        TEXT DEFAULT 'raw',
+                    importance         INTEGER DEFAULT 5,
+                    freshness          REAL DEFAULT 1.0,
+                    reference_count    INTEGER DEFAULT 0,
+                    linked_lesson_ids  TEXT DEFAULT '[]',
+                    created_at         TEXT DEFAULT (datetime('now','localtime')),
+                    last_referenced_at TEXT DEFAULT (datetime('now','localtime'))
+                );
+                CREATE INDEX IF NOT EXISTS idx_episodes_conversation ON episodes(conversation_id);
+                CREATE INDEX IF NOT EXISTS idx_episodes_compress_rank ON episodes(granularity, importance, freshness);
+            """)
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE memories ADD COLUMN freshness REAL DEFAULT 1.0")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE memories ADD COLUMN linked_episode_ids TEXT DEFAULT '[]'")
+        except Exception:
+            pass
+        try:
+            conn.execute("ALTER TABLE memories ADD COLUMN granularity TEXT DEFAULT 'raw'")
+        except Exception:
+            pass
+
+        # One-time migration: task_records/task_summaries are fully retired
+        # (superseded by episodes — see the CREATE TABLE episodes comment
+        # above). Any existing rows get folded into episodes (kind='task',
+        # granularity='summary' since a saved `summary` is already condensed,
+        # not a raw transcript) before the old tables are dropped, so
+        # pre-migration task history stays searchable via memory_search
+        # instead of silently vanishing. created_at is backdated to the
+        # original completed_at (not "now") so already-old tasks decay/
+        # compress on their real schedule rather than looking freshly made.
+        # Idempotent: no-ops once task_records no longer exists.
+        try:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            if "task_records" in tables:
+                rows = conn.execute(
+                    "SELECT id, session_id, goal, summary, importance, completed_at FROM task_records"
+                ).fetchall()
+                for r in rows:
+                    content = (r["summary"] or "").strip()
+                    content = f"{r['goal']}\n\n{content}" if content and content != r["goal"] else (content or r["goal"])
+                    if not content:
+                        continue
+                    conn.execute("""
+                        INSERT OR IGNORE INTO episodes
+                          (id, conversation_id, kind, task_id, content, granularity,
+                           importance, freshness, reference_count, linked_lesson_ids,
+                           created_at, last_referenced_at)
+                        VALUES (?,?,?,?,?,'summary',?,1.0,0,'[]',?,?)
+                    """, (
+                        f"migrated-{r['id']}", r["session_id"] or "", "task", r["id"],
+                        content, max(1, min(10, r["importance"] or 7)),
+                        r["completed_at"], r["completed_at"],
+                    ))
+                conn.execute("DROP TABLE IF EXISTS task_records")
+                conn.execute("DROP TABLE IF EXISTS task_summaries")
+                if rows:
+                    print(f"[migrate] moved {len(rows)} task_records row(s) into episodes; dropped task_records/task_summaries")
         except Exception:
             pass
 

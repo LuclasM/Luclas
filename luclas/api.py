@@ -30,9 +30,11 @@ from llm_client import LLMClient
 from llm_router import ModelRouter, load_models
 from memory.database import init_db
 from memory.store import MemoryStore
-from memory.task_memory import TaskMemory
+from memory.conversation_store import ConversationStore, TASK_EPISODE_TAG
+from memory.episode_store import EpisodeStore
 from tools.registry import build_tools
 from loops.task_runner import TaskRunner
+import conversation_runner
 import i18n as T
 
 # ---------------------------------------------------------------------------
@@ -52,9 +54,10 @@ _API_KEY = os.environ.get("LUC_API_KEY", "")
 # Singleton resources (one set shared across all requests)
 # ---------------------------------------------------------------------------
 
-_llm:         LLMClient   | None = None
-_store:       MemoryStore | None = None
-_task_memory: TaskMemory  | None = None
+_llm:         LLMClient        | None = None
+_store:       MemoryStore      | None = None
+_conversations = ConversationStore()
+_episodes      = EpisodeStore()
 
 # In-memory result store  {task_id: {...}}
 _results: dict[str, dict] = {}
@@ -69,18 +72,16 @@ _session_tasks: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup() -> None:
-    global _llm, _store, _task_memory
+    global _llm, _store
     for d in [RAW_DIR, SESSION_DIR,
               os.path.join(SESSION_DIR, "logs"),
               os.path.join(SESSION_DIR, "messages"),
               CORE_HIST]:
         os.makedirs(d, exist_ok=True)
     init_db()
-    # Reclaim task_records left stuck at tier='running' by a previous crash —
-    # api.py is a long-lived service, so unlike the CLI (which does this once
-    # per invocation) it would otherwise never happen, and get_running()/
-    # build_context() would keep injecting a phantom "still running" task
-    # into every future task's context indefinitely.
+    # Reclaim task_state memories left stuck by a previous crash — api.py is
+    # a long-lived service, so unlike the CLI (which does this once per
+    # invocation) it would otherwise never happen.
     from luclas import _cleanup_interrupted_state
     _cleanup_interrupted_state()
     _router = None
@@ -90,7 +91,6 @@ def _startup() -> None:
         print(f"[router] loaded {len(_loaded)} model(s) from models.json")
     _llm         = LLMClient(router=_router)
     _store       = MemoryStore()
-    _task_memory = TaskMemory()
     from adapters.discord_adapter import start_bot as _start_discord
     _start_discord()
 
@@ -216,7 +216,6 @@ def _run_task(task_id: str, goal: str, session_id: str,
 
     runner = TaskRunner(
         llm=task_llm, schemas=schemas, fns=fns,
-        task_memory=_task_memory,
         mem_store=_store, session_id=session_id,
         progress_callback=progress_callback,
         supplement_queue=effective_wait_queue,
@@ -250,6 +249,74 @@ def _run_task(task_id: str, goal: str, session_id: str,
             if _session_tasks.get(session_id) == task_id:
                 _session_tasks.pop(session_id, None)
                 _session_queues.pop(session_id, None)
+
+
+def _dispatch_task_for_conversation(conversation_id: str, goal: str, foreground: bool) -> dict:
+    """dispatch_task's implementation for the conversation layer — reuses
+    _run_task()/TaskRunner exactly as the old per-message /chat path did, so
+    push-based progress, ask_user()/supplement routing, and cron-style
+    channel resolution all keep working unchanged. Only the bookkeeping
+    around it differs: conversations.active_task_* tracks whether this is a
+    foreground ("work mode", replaces the conversation until done) or
+    background (conversation keeps going) dispatch, and a kind='task'
+    episode is recorded once the task finishes either way.
+
+    _run_task() already pushes the final result itself via on_result
+    (unless cron-prefixed, which conversation_id never is) — so this must
+    NOT push it again. That's what "delivered" in the return value signals
+    to conversation_runner.handle_turn(): for foreground it's True (already
+    pushed, don't send reply_text again); for background it's False (the
+    background thread below handles delivery once the task actually
+    finishes, and the immediate return here is just an ack for the
+    conversation model to react to in its own words).
+    """
+    task_id = uuid.uuid4().hex[:12]
+    q = queue.Queue()
+    with _lock:
+        _results[task_id] = {"status": "running", "result": "", "started_at": _now(), "finished_at": ""}
+        _session_queues[conversation_id] = q
+        _session_tasks[conversation_id]  = task_id
+    _conversations.set_active_task(conversation_id, task_id, foreground)
+
+    def _finish():
+        with _lock:
+            result = _results.get(task_id, {}).get("result", "")
+        _episodes.create_task_episode(conversation_id, task_id, result, importance=7)
+        _conversations.clear_active_task(conversation_id)
+        return result
+
+    if foreground:
+        _run_task(task_id, goal, conversation_id, q)  # blocks — caller is already off the HTTP thread
+        result = _finish()
+        return {"delivered": True, "result": result}
+
+    def _bg():
+        _run_task(task_id, goal, conversation_id, q)
+        result = _finish()
+        # _run_task already pushed `result` via its own on_result — only
+        # record it into the conversation transcript here, don't push again.
+        _conversations.append_message(conversation_id, "assistant", result,
+                                      episode_id=TASK_EPISODE_TAG)
+
+    threading.Thread(target=_bg, daemon=True).start()
+    return {"delivered": False, "started": True, "task_id": task_id}
+
+
+def _run_conversation_turn(conversation_id: str, message: str) -> None:
+    push = _make_push_callback(conversation_id)
+    try:
+        reply, already_delivered = conversation_runner.handle_turn(
+            conversation_id, message, llm=_llm, mem_store=_store,
+            episode_store=_episodes, conv_store=_conversations,
+            dispatch_fn=_dispatch_task_for_conversation,
+        )
+        if reply and not already_delivered and push:
+            push(reply)
+    except Exception as e:
+        print(f"[api] conversation turn failed for {conversation_id}: {e}", file=sys.stderr)
+        traceback.print_exc()
+        if push:
+            push(T.channel_task_failed(str(e)[:500]))
 
 
 def _set_result(task_id: str, status: str, result: str) -> None:
@@ -331,16 +398,14 @@ def health():
 
 
 class CommandRequest(BaseModel):
-    line: str   # e.g. "/tasks" or "/memory search foo"
+    line: str   # e.g. "/status" or "/memory search foo"
 
 
 @app.post("/command", dependencies=[Depends(_auth)])
 def run_command(req: CommandRequest):
     """Run a slash command synchronously and return its text output."""
     import io, contextlib, sys
-    from luclas import (
-        _handle_slash, _show_status, _show_tasks, _show_history,
-    )
+    from luclas import _handle_slash
     schemas, fns = build_tools(_store)
     buf = io.StringIO()
     try:
@@ -349,7 +414,6 @@ def run_command(req: CommandRequest):
                 req.line,
                 llm=_llm,
                 store=_store,
-                task_memory=_task_memory,
                 schemas=schemas,
                 fns=fns,
             )
@@ -385,40 +449,52 @@ def status():
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(_auth)])
 def chat(req: ChatRequest):
     """
-    Submit a task. Returns immediately with a task_id.
-    Poll GET /result/{task_id} for the outcome.
-    If the same session already has a running task, the message is injected
-    into that task as a supplement instead of starting a new one.
+    session_id doubles as the persistent conversation's own id (see
+    memory/conversation_store.py) — messaging adapters already derive a
+    stable per-user id in exactly this format ("wecom_<UserID>" etc.), so
+    the conversation layer needs no separate identity concept.
+
+    Cron-submitted tasks (session_id prefixed "cron_") bypass the
+    conversation layer entirely and keep going through _run_task() exactly
+    as before — cron has no live human on the other end to converse with.
+
+    For everything else: if the conversation is in foreground "work mode"
+    (a dispatch_task(foreground=true) is in flight), the message is injected
+    into that task's existing supplement mechanism, unchanged from before.
+    Otherwise (no active task, or a background task quietly running) a
+    conversation turn is run — conversation_runner.handle_turn() decides
+    whether this needs dispatch_task or is just a reply, and delivers the
+    result via push (adapters don't read this response body: see
+    adapters/dispatch.py's _submit_task, "no polling here").
     """
     session_id = req.session_id or uuid.uuid4().hex[:8]
 
-    with _lock:
-        running_task_id = _session_tasks.get(session_id)
-        if running_task_id and _results.get(running_task_id, {}).get("status") == "running":
-            # Inject into the running task instead of starting a new one
+    if session_id.startswith("cron_"):
+        with _lock:
+            task_id = uuid.uuid4().hex[:12]
+            q = queue.Queue()
+            _results[task_id] = {"status": "running", "result": "", "started_at": _now(), "finished_at": ""}
+            _session_queues[session_id] = q
+            _session_tasks[session_id]  = task_id
+        threading.Thread(target=_run_task, args=(task_id, req.message, session_id, q), daemon=True).start()
+        return {"task_id": task_id, "status": "running"}
+
+    conv = _conversations.get_or_create(session_id)
+
+    if conv["active_task_id"] and conv["active_task_foreground"]:
+        with _lock:
+            still_running = _results.get(conv["active_task_id"], {}).get("status") == "running"
             q = _session_queues.get(session_id)
-            if q is not None:
-                q.put(req.message)
-            return {"task_id": running_task_id, "status": "running"}
+        if still_running and q is not None:
+            q.put(req.message)
+            return {"task_id": conv["active_task_id"], "status": "running"}
+        # Stale bookkeeping (task actually finished but active_task_* wasn't
+        # cleared yet, or the process restarted mid-task) — fall through to
+        # a normal conversation turn instead of silently dropping the message.
+        _conversations.clear_active_task(session_id)
 
-        task_id = uuid.uuid4().hex[:12]
-        q = queue.Queue()
-        _results[task_id] = {
-            "status":      "running",
-            "result":      "",
-            "started_at":  _now(),
-            "finished_at": "",
-        }
-        _session_queues[session_id] = q
-        _session_tasks[session_id]  = task_id
-
-    t = threading.Thread(
-        target=_run_task,
-        args=(task_id, req.message, session_id, q),
-        daemon=True,
-    )
-    t.start()
-
+    task_id = uuid.uuid4().hex[:12]  # kept only for the response shape — conversation turns aren't polled via /result
+    threading.Thread(target=_run_conversation_turn, args=(session_id, req.message), daemon=True).start()
     return {"task_id": task_id, "status": "running"}
 
 

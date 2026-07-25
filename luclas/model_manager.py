@@ -367,6 +367,19 @@ def _form_screen(data: dict, is_new: bool, idx: int) -> bool:
     clf_raw = _prompt("Use as routing classifier?  (y/n)", clf_def)
     classifier = clf_raw.lower() in ("y", "yes", "true", "1")
 
+    # The conversation layer (memory/conversation_store.py) compresses the
+    # live conversation window once it crosses 70% of this figure — without
+    # it, compression falls back to a conservative 8192 and may trigger far
+    # earlier than this model can actually support.
+    ctx_raw = _prompt(
+        "Context window size  (tokens, used to decide when to compress conversations)",
+        str(data.get("context_length", 8192)),
+    )
+    try:
+        context_length = int(ctx_raw)
+    except ValueError:
+        context_length = 8192
+
     # ── Confirm ───────────────────────────────────────────────
     sys.stdout.write("\n  " + "-" * 60 + "\n")
     sys.stdout.write(f"  {_b('Summary')}\n")
@@ -376,6 +389,7 @@ def _form_screen(data: dict, is_new: bool, idx: int) -> bool:
     sys.stdout.write(f"  complexity: {complexity}   priority: {priority}\n")
     sys.stdout.write(f"  types:      {', '.join(task_types)}\n")
     sys.stdout.write(f"  classifier: {'yes' if classifier else 'no'}\n")
+    sys.stdout.write(f"  context:    {context_length} tokens\n")
     sys.stdout.write("  " + "-" * 60 + "\n")
     sys.stdout.write(f"  {_b('Save?')} [Y/n]: ")
     sys.stdout.flush()
@@ -393,6 +407,7 @@ def _form_screen(data: dict, is_new: bool, idx: int) -> bool:
         "priority":   priority,
         "complexity": complexity,
         "task_types": task_types,
+        "context_length": context_length,
     }
     if classifier:
         record["classifier"] = True

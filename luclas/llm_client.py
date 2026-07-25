@@ -80,6 +80,18 @@ class LLMClient:
         return self._active.name if self._active else self._default_model
 
     @property
+    def context_length(self) -> int:
+        """Token budget memory/conversation_store.py compresses against. Falls
+        back to the first configured model's figure if set_goal() hasn't run
+        yet (the conversation layer doesn't classify/route by goal — it just
+        uses whichever model is active), then to a conservative default."""
+        if self._active:
+            return self._active.context_length
+        if self._router and self._router.models:
+            return self._router.models[0].context_length
+        return 8192
+
+    @property
     def _headers(self) -> dict:
         api_key = self._active.api_key if self._active else self._default_api_key
         return {
