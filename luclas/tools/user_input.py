@@ -78,6 +78,27 @@ def _lock_for_session(session_id) -> threading.Lock:
         return lock
 
 
+# Which sessions currently have an ask_user() call blocked waiting on
+# wait_queue.get(). api.py's /chat needs this: a *background* dispatch_task
+# has active_task_foreground=False, so its normal routing lets a new
+# incoming message start an independent conversation turn instead of being
+# treated as a supplement — correct when the task is just running quietly,
+# but wrong the moment it's actually sitting in ask_user() waiting for an
+# answer, since then the next message IS that answer and needs to land on
+# this same wait_queue, not be diverted into a fresh turn (which is what
+# happened before this existed: the question was pushed correctly, but the
+# reply was silently routed elsewhere and ask_user() always ran out the
+# full ASK_USER_TIMEOUT_SECONDS before giving up, regardless of how fast the
+# user actually answered).
+_pending_questions: set = set()
+_pending_questions_lock = threading.Lock()
+
+
+def has_pending_question(session_id) -> bool:
+    with _pending_questions_lock:
+        return session_id in _pending_questions
+
+
 def set_channel_context(push, wait_queue, session_id=None) -> None:
     """Call at the start of a channel-driven task thread so ask_user() can
     push questions to the user and block for their reply on wait_queue."""
@@ -111,10 +132,15 @@ def ask_user(question: str) -> str:
                 push(f"❓ {question}")
             except Exception:
                 pass
+            with _pending_questions_lock:
+                _pending_questions.add(session_id)
             try:
                 answer = wait_queue.get(timeout=ASK_USER_TIMEOUT_SECONDS)
             except queue.Empty:
                 return T.ask_user_no_answer()
+            finally:
+                with _pending_questions_lock:
+                    _pending_questions.discard(session_id)
             return answer.strip() if answer and answer.strip() else T.ask_user_no_answer()
 
         if not sys.stdin.isatty():

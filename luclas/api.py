@@ -514,7 +514,16 @@ def chat(req: ChatRequest):
 
     conv = _conversations.get_or_create(session_id)
 
-    if conv["active_task_id"] and conv["active_task_foreground"]:
+    # A background task (active_task_foreground=False) normally lets a new
+    # message start its own independent conversation turn — that's the
+    # entire point of running it in the background. But the moment it's
+    # actually sitting in ask_user() waiting on this same session's
+    # supplement queue, the next message IS the answer to that question, not
+    # a new topic, and must be routed there instead — see
+    # tools/user_input.py::has_pending_question() for why this needs to be
+    # tracked separately from the foreground flag.
+    from tools.user_input import has_pending_question
+    if conv["active_task_id"] and (conv["active_task_foreground"] or has_pending_question(session_id)):
         with _lock:
             still_running = _results.get(conv["active_task_id"], {}).get("status") == "running"
             q = _session_queues.get(session_id)
