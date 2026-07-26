@@ -48,7 +48,6 @@ Luclas grows faster with real work than with test questions.
 - **Long-term memory** — split into episodes (one per finished task or conversation topic) and lessons (facts/experience/opinions, with **source/credibility** tracking — first-hand experience, user instruction, learning material, web, etc., 1-10 confidence score), searchable via semantic search (sentence-transformers + cosine similarity, keyword fallback). Both share one importance/freshness-driven compression scheme that gradually condenses and eventually forgets low-value entries, instead of a fixed archive-then-summarize schedule.
 - **Multi-model routing** — configure several local/hosted models in `data/models.json` (`/models edit` for an interactive TUI manager) and Luclas classifies each task's complexity/type to route it to the right one, escalating to a stronger model on failure. Works with a single model too — this is entirely optional.
 - **Local LLM auto-detection** — setup scans for a running Ollama, LM Studio, or vLLM server on common local ports and offers it as a ready-to-use option, instead of requiring you to already know the base URL/port.
-- **Feedback loop** — after a task that's non-routine (first time doing something, mid-task errors, long-running, large/multi-step, or an open-ended result), Luclas asks how it went, saves the exchange as a memory, and — if you give it a corrected approach and confirm — redoes the task differently. Skipped automatically for simple, routine tasks.
 - **Tool use** — shell, Python (subprocess-isolated), file ops, grep/find, HTTP, web search/fetch, memory read/write, scheduled tasks.
 - **Messaging adapters** — WeCom (企业微信), WhatsApp, and Discord, all sharing one dispatch layer (command/task routing, reply language via `LUC_LANG`) so behavior is consistent across channels; more platforms coming.
 - **HTTP API** — submit tasks asynchronously, poll for results, integrate with external systems.
@@ -102,7 +101,7 @@ luclas/
   local_llm_detect.py  auto-detect a running Ollama/LM Studio/vLLM server
   loops/
     agent_loop.py      core LLM ↔ tool execution loop
-    task_runner.py     recursive decompose/execute/merge, feedback loop
+    task_runner.py     recursive decompose/execute/merge
   memory/
     database.py        SQLite schema and migrations
     conversation_store.py  persistent per-user/channel conversation

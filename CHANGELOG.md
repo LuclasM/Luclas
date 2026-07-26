@@ -3,6 +3,27 @@
 All notable changes to this project are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Removed
+- **Post-task feedback question** — Luclas no longer asks "how did this go?"
+  after a task completes, nor offers to redo it with a corrected approach
+  based on the answer. AAR (after-action-review) experience capture is
+  unaffected — a task still writes what it learned to long-term memory
+  regardless.
+
+### Fixed
+- Background `dispatch_task` unconditionally pushed live tool-call progress
+  ("💭 thinking / ▶ tool_name") to the messaging channel exactly like
+  foreground ("watch it happen") mode, confirmed via a real WeChat test —
+  it now stays quiet mid-task and only delivers the ack and final answer.
+- A background task's `ask_user()` question was pushed correctly but the
+  user's reply was misrouted into a brand-new conversation turn instead of
+  reaching the waiting task, on both the messaging-channel and CLI paths —
+  the CLI case was worse, an actual stdin race between the main REPL loop
+  and the background thread both calling `input()`. Both now route the
+  reply correctly.
+
 ## [0.3.2] - 2026-07-25
 
 ### Changed
