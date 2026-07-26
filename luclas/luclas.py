@@ -1,4 +1,4 @@
-__version__ = "0.3.4"
+__version__ = "0.3.5"
 
 import builtins
 import datetime
@@ -233,7 +233,6 @@ def main():
 def _run_task(goal: str, runner: TaskRunner):
     print(f"\n{head(T.task_started())}")
     try:
-        # Show the result before any feedback prompt runner.run() may trigger internally.
         runner.run(goal, on_result=lambda r: print(f"\n{head(T.task_done())}\n{r}\n"))
     except KeyboardInterrupt:
         print(T.task_interrupted())

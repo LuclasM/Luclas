@@ -235,11 +235,10 @@ def _run_task(task_id: str, goal: str, session_id: str,
     # queue. So ask_user() must not wait on it: with a real queue, ask_user()
     # would push the question and then block for up to
     # ASK_USER_TIMEOUT_SECONDS on an answer that can structurally never
-    # arrive, for every question, including the post-task feedback prompt.
-    # Passing None here makes ask_user() take its immediate _NeedUserInput
-    # path instead — the question still reaches the user (as the task's
-    # final result, via cron's own poll+notify), just without the pointless
-    # wait first.
+    # arrive. Passing None here makes ask_user() take its immediate
+    # _NeedUserInput path instead — the question still reaches the user (as
+    # the task's final result, via cron's own poll+notify), just without the
+    # pointless wait first.
     effective_wait_queue = None if is_cron else supplement_queue
 
     # Per-task LLM client so concurrent sessions don't share _model_queue / _current_idx.
@@ -252,13 +251,10 @@ def _run_task(task_id: str, goal: str, session_id: str,
         progress_callback=progress_callback,
         supplement_queue=effective_wait_queue,
     )
-    # Lets ask_user() (mid-task tool call or the post-task feedback loop) push
-    # questions to this channel and block for the reply on the same queue used
-    # for mid-task supplements — this thread is dedicated to this one task.
+    # Lets ask_user() (a mid-task tool call) push questions to this channel
+    # and block for the reply on the same queue used for mid-task
+    # supplements — this thread is dedicated to this one task.
     set_channel_context(push=push, wait_queue=effective_wait_queue, session_id=session_id)
-    # Show the full result before any feedback prompt runner.run() may trigger
-    # internally (ask_user() pushes to the same channel) — otherwise the
-    # feedback question arrives before the user has seen what was produced.
     on_result = (lambda r: push(r or T.channel_done())) if (push and not is_cron) else None
     try:
         result = runner.run(goal, on_result=on_result)
