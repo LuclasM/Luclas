@@ -122,24 +122,65 @@ def _verify_signature(signature: str, timestamp: str, nonce: str, echostr_or_enc
 # 发送消息给用户
 # ---------------------------------------------------------------------------
 
+# WeCom's app-message send API caps text.content at 2048 bytes (UTF-8) —
+# a long task result (easily several KB) sent as one message either gets
+# rejected outright or silently truncated by WeCom's own server, and either
+# way _send_text previously never even looked at the response body to
+# notice: post_with_retry only retries/raises on transport-level failures
+# (connection errors, 429/5xx), but a content-too-long rejection comes back
+# as a normal 200 OK with a nonzero `errcode` in the JSON body — a real
+# WeCom test session confirmed this exact failure mode ("split it into
+# multiple messages" landed only the first, later ones vanished with
+# nothing in the logs). Chunk below the limit and actually check errcode.
+_MAX_MESSAGE_BYTES = 2000  # 2048 with margin
+
+
+def _chunk_text(content: str, max_bytes: int = _MAX_MESSAGE_BYTES) -> list:
+    """Split content into pieces that each fit within max_bytes once UTF-8
+    encoded, without cutting a multi-byte character in half."""
+    if len(content.encode("utf-8")) <= max_bytes:
+        return [content]
+    chunks = []
+    current = []
+    current_bytes = 0
+    for ch in content:
+        ch_bytes = len(ch.encode("utf-8"))
+        if current_bytes + ch_bytes > max_bytes and current:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(ch)
+        current_bytes += ch_bytes
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 def _send_text(user_id: str, content: str) -> None:
     if not CORP_ID or not SECRET or not AGENT_ID:
         return
     token = _get_access_token()
-    try:
-        dispatch.post_with_retry(
-            "https://qyapi.weixin.qq.com/cgi-bin/message/send",
-            params={"access_token": token},
-            json={
-                "touser":  user_id,
-                "msgtype": "text",
-                "agentid": int(AGENT_ID),
-                "text":    {"content": content},
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"[wecom] failed to deliver message to {user_id} after retries: {e}")
+    chunks = _chunk_text(content)
+    for i, chunk in enumerate(chunks):
+        try:
+            resp = dispatch.post_with_retry(
+                "https://qyapi.weixin.qq.com/cgi-bin/message/send",
+                params={"access_token": token},
+                json={
+                    "touser":  user_id,
+                    "msgtype": "text",
+                    "agentid": int(AGENT_ID),
+                    "text":    {"content": chunk},
+                },
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("errcode"):
+                print(f"[wecom] send to {user_id} failed (part {i + 1}/{len(chunks)}): "
+                      f"errcode={data.get('errcode')} errmsg={data.get('errmsg')}")
+        except Exception as e:
+            print(f"[wecom] failed to deliver message to {user_id} after retries "
+                  f"(part {i + 1}/{len(chunks)}): {e}")
 
 
 # ---------------------------------------------------------------------------
