@@ -47,13 +47,40 @@ def _load_api_key() -> str:
     return _API_KEY
 
 
+# WeCom's text.content cap is ~2048 UTF-8 bytes; see adapters/wecom.py's
+# _chunk_text for the same limit and rationale. Duplicated here (rather than
+# imported) because cron_runner.py is intentionally dependency-light
+# (urllib, not requests/fastapi) so it keeps working even if those packages
+# aren't set up in whatever environment cron invokes it from.
+_MAX_WECOM_MESSAGE_BYTES = 2000
+
+
+def _chunk_text(content: str, max_bytes: int = _MAX_WECOM_MESSAGE_BYTES) -> list:
+    """Split content into pieces that each fit within max_bytes once UTF-8
+    encoded, without cutting a multi-byte character in half."""
+    if len(content.encode("utf-8")) <= max_bytes:
+        return [content]
+    chunks = []
+    current = []
+    current_bytes = 0
+    for ch in content:
+        ch_bytes = len(ch.encode("utf-8"))
+        if current_bytes + ch_bytes > max_bytes and current:
+            chunks.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(ch)
+        current_bytes += ch_bytes
+    if current:
+        chunks.append("".join(current))
+    return chunks
+
+
 def _notify_wecom(user_id: str, content: str) -> None:
-    """Send content to a WeCom user via the local API."""
-    import urllib.request, urllib.parse, json as _json
-    key = _load_api_key()
-    data = _json.dumps({"line": f"__wecom_send__{user_id}__", "_direct": content}).encode()
-    # Use the /command endpoint indirectly — actually POST /chat and let wecom handle it.
-    # Simpler: call WeCom send API directly.
+    """Send content to a WeCom user via the corp API, chunked to fit WeCom's
+    per-message byte cap (long content was previously sent in one call and
+    silently rejected/truncated by WeCom past ~2048 bytes)."""
+    import urllib.request, json as _json
     env_path = os.path.join(os.path.dirname(CODE_DIR), ".env")
     env = {}
     try:
@@ -71,7 +98,6 @@ def _notify_wecom(user_id: str, content: str) -> None:
         _log("wecom notify: missing credentials")
         return
     try:
-        # Get token
         url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={corp_id}&corpsecret={secret}"
         with urllib.request.urlopen(url, timeout=10) as r:
             token_data = _json.loads(r.read())
@@ -79,28 +105,50 @@ def _notify_wecom(user_id: str, content: str) -> None:
         if not token:
             _log(f"wecom notify: token error {token_data}")
             return
-        # Send message
-        payload = _json.dumps({
-            "touser": user_id, "msgtype": "text",
-            "agentid": int(agent_id), "text": {"content": content},
-        }).encode()
-        req = urllib.request.Request(
-            f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}",
-            data=payload, headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as r:
-            result = _json.loads(r.read())
-        if result.get("errcode", 0) != 0:
-            _log(f"wecom notify: send error {result}")
-        else:
-            _log(f"wecom notify: sent to {user_id}")
     except Exception as e:
         _log(f"wecom notify: exception {e}")
+        return
+
+    chunks = _chunk_text(content)
+    for i, chunk in enumerate(chunks):
+        try:
+            payload = _json.dumps({
+                "touser": user_id, "msgtype": "text",
+                "agentid": int(agent_id), "text": {"content": chunk},
+            }).encode()
+            req = urllib.request.Request(
+                f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}",
+                data=payload, headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                result = _json.loads(r.read())
+            if result.get("errcode", 0) != 0:
+                _log(f"wecom notify: send error (part {i + 1}/{len(chunks)}) {result}")
+            else:
+                _log(f"wecom notify: sent to {user_id} (part {i + 1}/{len(chunks)})")
+        except Exception as e:
+            _log(f"wecom notify: exception (part {i + 1}/{len(chunks)}) {e}")
+
+
+def _chunk_text_by_chars(content: str, max_chars: int) -> list:
+    """Split content into pieces of at most max_chars characters. Used for
+    APIs (WhatsApp, Discord) whose message caps are defined in characters
+    rather than UTF-8 bytes (see _chunk_text above for the byte-based one)."""
+    if len(content) <= max_chars:
+        return [content]
+    return [content[i:i + max_chars] for i in range(0, len(content), max_chars)]
+
+
+# WhatsApp's text message body cap is 4096 characters.
+_MAX_WHATSAPP_MESSAGE_CHARS = 4000
 
 
 def _notify_whatsapp(phone: str, content: str) -> None:
-    """Send content to a WhatsApp number via Meta Graph API."""
-    import urllib.request, json as _json
+    """Send content to a WhatsApp number via Meta Graph API, chunked to fit
+    WhatsApp's per-message character cap (long content was previously sent
+    in one call and rejected by the Graph API past 4096 characters, with the
+    response never even inspected for the error)."""
+    import urllib.error, urllib.request, json as _json
     env_path = os.path.join(os.path.dirname(CODE_DIR), ".env")
     env: dict[str, str] = {}
     try:
@@ -116,31 +164,45 @@ def _notify_whatsapp(phone: str, content: str) -> None:
     if not phone_number_id or not access_token:
         _log("whatsapp notify: missing credentials")
         return
-    try:
-        payload = _json.dumps({
-            "messaging_product": "whatsapp",
-            "to": phone,
-            "type": "text",
-            "text": {"body": content},
-        }).encode()
-        req = urllib.request.Request(
-            f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
-            data=payload,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-        _log(f"whatsapp notify: sent to {phone}")
-    except Exception as e:
-        _log(f"whatsapp notify: exception {e}")
+
+    chunks = _chunk_text_by_chars(content, _MAX_WHATSAPP_MESSAGE_CHARS)
+    for i, chunk in enumerate(chunks):
+        try:
+            payload = _json.dumps({
+                "messaging_product": "whatsapp",
+                "to": phone,
+                "type": "text",
+                "text": {"body": chunk},
+            }).encode()
+            req = urllib.request.Request(
+                f"https://graph.facebook.com/v19.0/{phone_number_id}/messages",
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                result = _json.loads(r.read())
+            if "error" in result:
+                _log(f"whatsapp notify: send error (part {i + 1}/{len(chunks)}) {result['error']}")
+            else:
+                _log(f"whatsapp notify: sent to {phone} (part {i + 1}/{len(chunks)})")
+        except urllib.error.HTTPError as e:
+            _log(f"whatsapp notify: HTTP error (part {i + 1}/{len(chunks)}) {e.code} {e.read()}")
+        except Exception as e:
+            _log(f"whatsapp notify: exception (part {i + 1}/{len(chunks)}) {e}")
+
+
+# Discord's hard message-content cap is 2000 characters.
+_MAX_DISCORD_MESSAGE_CHARS = 2000
 
 
 def _notify_discord(user_id: str, content: str) -> None:
-    """Send a DM to a Discord user via REST API."""
-    import urllib.request, json as _json
+    """Send a DM to a Discord user via REST API, chunked to fit Discord's
+    2000-character message cap (long content was previously hard-truncated
+    with content[:2000], silently dropping the rest)."""
+    import urllib.error, urllib.request, json as _json
     env_path = os.path.join(os.path.dirname(CODE_DIR), ".env")
     env: dict[str, str] = {}
     try:
@@ -156,7 +218,6 @@ def _notify_discord(user_id: str, content: str) -> None:
         _log("discord notify: missing bot token")
         return
     try:
-        # Create DM channel
         payload = _json.dumps({"recipient_id": user_id}).encode()
         req = urllib.request.Request(
             "https://discord.com/api/v10/users/@me/channels",
@@ -169,21 +230,29 @@ def _notify_discord(user_id: str, content: str) -> None:
         with urllib.request.urlopen(req, timeout=10) as r:
             dm = _json.loads(r.read())
         dm_channel_id = dm["id"]
-        # Send message
-        payload = _json.dumps({"content": content[:2000]}).encode()
-        req = urllib.request.Request(
-            f"https://discord.com/api/v10/channels/{dm_channel_id}/messages",
-            data=payload,
-            headers={
-                "Authorization": f"Bot {bot_token}",
-                "Content-Type": "application/json",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10):
-            pass
-        _log(f"discord notify: DM sent to {user_id}")
     except Exception as e:
-        _log(f"discord notify: exception {e}")
+        _log(f"discord notify: failed to open DM channel: {e}")
+        return
+
+    chunks = _chunk_text_by_chars(content, _MAX_DISCORD_MESSAGE_CHARS)
+    for i, chunk in enumerate(chunks):
+        try:
+            payload = _json.dumps({"content": chunk}).encode()
+            req = urllib.request.Request(
+                f"https://discord.com/api/v10/channels/{dm_channel_id}/messages",
+                data=payload,
+                headers={
+                    "Authorization": f"Bot {bot_token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            _log(f"discord notify: DM sent to {user_id} (part {i + 1}/{len(chunks)})")
+        except urllib.error.HTTPError as e:
+            _log(f"discord notify: HTTP error (part {i + 1}/{len(chunks)}) {e.code} {e.read()}")
+        except Exception as e:
+            _log(f"discord notify: exception (part {i + 1}/{len(chunks)}) {e}")
 
 
 # ---------------------------------------------------------------------------
