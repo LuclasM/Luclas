@@ -57,7 +57,7 @@ def test_cli_dispatch_builds_a_fresh_llm_client_per_call_not_shared(isolated_db,
     dispatch = luclas._make_cli_dispatch(conv_store, episode_store, shared_llm, store, [], {})
 
     def worker(n):
-        dispatch(f"conv{n}", f"goal {n}", False)
+        dispatch(f"conv{n}", f"conv{n}", f"goal {n}", False)
 
     t1 = threading.Thread(target=worker, args=(1,))
     t2 = threading.Thread(target=worker, args=(2,))

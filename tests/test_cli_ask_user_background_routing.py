@@ -56,7 +56,7 @@ def test_cli_background_ask_user_does_not_call_input_and_receives_routed_answer(
     monkeypatch.setattr(builtins, "input", tracking_input)
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
 
-    dispatch("cli_local", "问用户一个问题", False)  # background
+    dispatch("cli_local", "cli_local", "问用户一个问题", False)  # background
 
     for _ in range(100):
         if has_pending_question("cli_local"):
