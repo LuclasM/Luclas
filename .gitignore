@@ -22,5 +22,6 @@ __pycache__/
 
 # Misc scratch files
 *.html
+!luclas/static/**/*.html
 *.pdf
 cookies*.txt

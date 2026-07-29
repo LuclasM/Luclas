@@ -95,3 +95,34 @@ def load_core() -> str:
         content = f.read()
     _last_loaded_hash[path] = _hash(content)
     return content
+
+
+def list_core_snapshots() -> list[dict]:
+    """List history snapshots newest-first, each with its update reason
+    (the first line's comment, written by core_update()). Shared by the CLI
+    (/core history) and the web API (GET /api/system/core/history) so
+    there's exactly one implementation of "what's a valid snapshot name."""
+    if not os.path.isdir(CORE_HIST):
+        return []
+    snaps = sorted(os.listdir(CORE_HIST), reverse=True)
+    result = []
+    for s in snaps:
+        try:
+            with open(os.path.join(CORE_HIST, s), encoding="utf-8") as f:
+                first = f.readline().strip()
+            reason = first.replace(T.core_update_reason_prefix(), "").replace(" -->", "")
+        except Exception:
+            reason = ""
+        result.append({"name": s, "reason": reason})
+    return result
+
+
+def read_core_snapshot(name: str) -> str:
+    """Read one history snapshot by exact filename. Only accepts a name
+    returned by list_core_snapshots() — callers taking `name` from an HTTP
+    request must not join client input into a path without this check."""
+    valid_names = {s["name"] for s in list_core_snapshots()}
+    if name not in valid_names:
+        raise FileNotFoundError(name)
+    with open(os.path.join(CORE_HIST, name), encoding="utf-8") as f:
+        return f.read()

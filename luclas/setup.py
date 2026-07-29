@@ -388,48 +388,11 @@ def _step_preferences() -> tuple[dict[str, str], str]:
 
 
 # ── .env writer ───────────────────────────────────────────────────────────────
+# See env_store.py for the implementation (shared with the web Settings page).
 
 def _write_env(base_dir: str, new_vars: dict[str, str]) -> None:
-    env_path = os.path.join(base_dir, ".env")
-    lines: list[str] = []
-    updated: set[str] = set()
-
-    if os.path.isfile(env_path):
-        with open(env_path, encoding="utf-8") as f:
-            for line in f:
-                stripped = line.rstrip("\n")
-                if stripped and not stripped.startswith("#") and "=" in stripped:
-                    k = stripped.split("=", 1)[0].strip()
-                    if k in new_vars:
-                        lines.append(f"{k}={new_vars[k]}\n")
-                        updated.add(k)
-                        continue
-                lines.append(line if line.endswith("\n") else line + "\n")
-
-        # Back up the previous .env before touching it — this file holds every
-        # configured secret (LLM key, messaging platform credentials, etc.),
-        # so an interrupted write here would otherwise lose all of it at once.
-        import datetime
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{env_path}.bak.{ts}"
-        with open(env_path, encoding="utf-8") as src, open(backup_path, "w", encoding="utf-8") as dst:
-            dst.write(src.read())
-
-    new_keys = {k: v for k, v in new_vars.items() if k not in updated}
-    if new_keys:
-        if lines and lines[-1].strip():
-            lines.append("\n")
-        for k, v in new_keys.items():
-            lines.append(f"{k}={v}\n")
-
-    # Atomic write: temp file + rename, so a crash mid-write can't leave a
-    # truncated .env behind (the pre-existing backup above covers the rest).
-    tmp_path = f"{env_path}.tmp-{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, env_path)
+    from env_store import write_env
+    write_env(new_vars, base_dir)
 
 
 def _write_direction(base_dir: str, note: str) -> None:

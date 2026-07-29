@@ -265,21 +265,21 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
     route the next typed line there instead of starting a new conversation
     turn, exactly like api.py's /chat does for a pending question.
     """
-    def dispatch(conversation_id: str, goal: str, foreground: bool) -> dict:
+    def dispatch(session_id: str, memory_id: str, goal: str, foreground: bool) -> dict:
         task_llm = LLMClient(router=llm._router if llm else None)
         q = queue.Queue()
         task_runner = TaskRunner(
             llm=task_llm, schemas=schemas, fns=fns,
-            mem_store=store, session_id=conversation_id,
+            mem_store=store, session_id=session_id,
             supplement_queue=q,
         )
 
         def _run(record_in_history: bool) -> str:
             if record_in_history:
-                _cli_pending_queues[conversation_id] = q
+                _cli_pending_queues[session_id] = q
                 set_channel_context(
                     push=lambda msg: print(f"\n{warn(T.ask_user_label())} {msg}\n"),
-                    wait_queue=q, session_id=conversation_id,
+                    wait_queue=q, session_id=session_id,
                 )
             print(f"\n{head(T.task_started())}")
             try:
@@ -294,9 +294,9 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
             finally:
                 if record_in_history:
                     clear_channel_context()
-                    _cli_pending_queues.pop(conversation_id, None)
-            episode_store.create_task_episode(conversation_id, uuid.uuid4().hex[:12], result, importance=7)
-            conv_store.clear_active_task(conversation_id)
+                    _cli_pending_queues.pop(session_id, None)
+            episode_store.create_task_episode(memory_id, uuid.uuid4().hex[:12], result, importance=7)
+            conv_store.clear_active_task(session_id)
             if record_in_history:
                 # Background dispatch: handle_turn() already returned (its
                 # own reply was the immediate ack, e.g. "好的，我这就去处理"),
@@ -307,11 +307,11 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
                 # already_delivered=True). Without this, a background task's
                 # outcome would only ever be visible in the printed terminal
                 # output, never recalled naturally in later conversation turns.
-                conv_store.append_message(conversation_id, "assistant", result, episode_id=TASK_EPISODE_TAG)
+                conv_store.append_message(memory_id, "assistant", result, episode_id=TASK_EPISODE_TAG)
             return result
 
         task_id = uuid.uuid4().hex[:12]
-        conv_store.set_active_task(conversation_id, task_id, foreground)
+        conv_store.set_active_task(session_id, task_id, foreground)
         if foreground:
             return {"delivered": True, "result": _run(record_in_history=False)}
         threading.Thread(target=_run, kwargs={"record_in_history": True}, daemon=True).start()
@@ -323,7 +323,7 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
 def _run_conversation_turn(message: str, llm, store, episode_store, conv_store, dispatch_fn):
     try:
         reply, already_delivered = conversation_runner.handle_turn(
-            CLI_CONVERSATION_ID, message, llm=llm, mem_store=store,
+            CLI_CONVERSATION_ID, CLI_CONVERSATION_ID, message, llm=llm, mem_store=store,
             episode_store=episode_store, conv_store=conv_store,
             dispatch_fn=dispatch_fn,
         )
@@ -454,35 +454,27 @@ def _show_models(llm: LLMClient):
 
 
 def _core_cmd(sub: str, rest: str):
+    from tools.core_tools import list_core_snapshots, read_core_snapshot
+
     if sub == "history" and rest:
         # 查看某个历史版本
-        snap = os.path.join(CORE_HIST, rest if rest.endswith(".md") else rest + ".md")
-        if not os.path.isfile(snap):
+        name = rest if rest.endswith(".md") else rest + ".md"
+        try:
+            content = read_core_snapshot(name)
+        except FileNotFoundError:
             print(err(T.snapshot_not_found(rest)))
             return
-        with open(snap, encoding="utf-8") as f:
-            print(head(T.snapshot_title(rest)))
-            print(f.read())
+        print(head(T.snapshot_title(rest)))
+        print(content)
     elif sub == "history":
         # 列出历史
-        if not os.path.isdir(CORE_HIST):
-            print(T.no_snapshots())
-            return
-        snaps = sorted(os.listdir(CORE_HIST), reverse=True)
+        snaps = list_core_snapshots()
         if not snaps:
             print(T.no_snapshots())
             return
         print(head(T.snapshots_title(len(snaps))))
         for s in snaps:
-            spath = os.path.join(CORE_HIST, s)
-            # 读取第一行（更新原因注释）
-            try:
-                with open(spath, encoding="utf-8") as f:
-                    first = f.readline().strip()
-                reason = first.replace(T.core_update_reason_prefix(), "").replace(" -->", "")
-            except Exception:
-                reason = ""
-            print(f"  {dim(s)}  {reason}")
+            print(f"  {dim(s['name'])}  {s['reason']}")
         print()
     else:
         # 显示当前策略

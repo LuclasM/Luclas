@@ -45,8 +45,10 @@ app = FastAPI(title="Luclas API", version="1.0", docs_url="/docs")
 
 from adapters.wecom import router as wecom_router
 from adapters.whatsapp import router as whatsapp_router
+from adapters.web import router as web_sse_router
 app.include_router(wecom_router)
 app.include_router(whatsapp_router)
+app.include_router(web_sse_router)
 
 _API_KEY = os.environ.get("LUC_API_KEY", "")
 
@@ -126,6 +128,21 @@ def _auth(x_api_key: str = Header(default="")) -> None:
         raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key")
 
 
+# web_api.py imports `_auth` from this module at its own load time, so this
+# include must come after _auth is defined above — including it earlier
+# (e.g. next to the wecom/whatsapp routers) would try to import _auth before
+# it exists yet, since api.py is still mid-execution at that point.
+from web_api import system_router, settings_router
+app.include_router(system_router)
+app.include_router(settings_router)
+
+# Web UI static frontend, mounted at /ui (not "/") so a typo'd API path
+# still 404s instead of being swallowed by StaticFiles' html=True fallback.
+from fastapi.staticfiles import StaticFiles
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -197,6 +214,15 @@ def _make_push_callback(session_id: str):
                     _dc_send(msg[i:i + 1900])
             except Exception as e:
                 print(f"[api] push to discord session {session_id} failed: {e}", file=sys.stderr)
+        return _cb
+
+    if session_id.startswith("web_"):
+        from adapters.web import push as _web_push
+        def _cb(msg: str):
+            try:
+                _web_push(session_id, msg)
+            except Exception as e:
+                print(f"[api] push to web session {session_id} failed: {e}", file=sys.stderr)
         return _cb
 
     return None
@@ -279,7 +305,7 @@ def _run_task(task_id: str, goal: str, session_id: str,
                 _session_queues.pop(session_id, None)
 
 
-def _dispatch_task_for_conversation(conversation_id: str, goal: str, foreground: bool) -> dict:
+def _dispatch_task_for_conversation(session_id: str, memory_id: str, goal: str, foreground: bool) -> dict:
     """dispatch_task's implementation for the conversation layer — reuses
     _run_task()/TaskRunner exactly as the old per-message /chat path did, so
     push-based progress, ask_user()/supplement routing, and cron-style
@@ -289,10 +315,18 @@ def _dispatch_task_for_conversation(conversation_id: str, goal: str, foreground:
     background (conversation keeps going) dispatch, and a kind='task'
     episode is recorded once the task finishes either way.
 
+    session_id (the physical channel connection) drives everything live —
+    task tracking, ask_user supplement routing, and push delivery — exactly
+    as before identity switching existed. memory_id (possibly a different,
+    identity-resolved conversation — see memory/identity_store.py) is used
+    only for where the *finished* task's episode/transcript gets recorded,
+    so it lands in the right person's history even if they're chatting
+    under a switched identity on this channel.
+
     _run_task() already pushes the final result itself via on_result
-    (unless cron-prefixed, which conversation_id never is) — so this must
-    NOT push it again. That's what "delivered" in the return value signals
-    to conversation_runner.handle_turn(): for foreground it's True (already
+    (unless cron-prefixed, which session_id never is) — so this must NOT
+    push it again. That's what "delivered" in the return value signals to
+    conversation_runner.handle_turn(): for foreground it's True (already
     pushed, don't send reply_text again); for background it's False (the
     background thread below handles delivery once the task actually
     finishes, and the immediate return here is just an ack for the
@@ -302,47 +336,59 @@ def _dispatch_task_for_conversation(conversation_id: str, goal: str, foreground:
     q = queue.Queue()
     with _lock:
         _results[task_id] = {"status": "running", "result": "", "started_at": _now(), "finished_at": ""}
-        _session_queues[conversation_id] = q
-        _session_tasks[conversation_id]  = task_id
-    _conversations.set_active_task(conversation_id, task_id, foreground)
+        _session_queues[session_id] = q
+        _session_tasks[session_id]  = task_id
+    _conversations.set_active_task(session_id, task_id, foreground)
 
     def _finish():
         with _lock:
             result = _results.get(task_id, {}).get("result", "")
-        _episodes.create_task_episode(conversation_id, task_id, result, importance=7)
-        _conversations.clear_active_task(conversation_id)
+        _episodes.create_task_episode(memory_id, task_id, result, importance=7)
+        _conversations.clear_active_task(session_id)
         return result
 
     if foreground:
-        _run_task(task_id, goal, conversation_id, q, show_progress=True)  # blocks — caller is already off the HTTP thread
+        _run_task(task_id, goal, session_id, q, show_progress=True)  # blocks — caller is already off the HTTP thread
         result = _finish()
         return {"delivered": True, "result": result}
 
     def _bg():
-        _run_task(task_id, goal, conversation_id, q, show_progress=False)
+        _run_task(task_id, goal, session_id, q, show_progress=False)
         result = _finish()
         # _run_task already pushed `result` via its own on_result — only
         # record it into the conversation transcript here, don't push again.
-        _conversations.append_message(conversation_id, "assistant", result,
+        _conversations.append_message(memory_id, "assistant", result,
                                       episode_id=TASK_EPISODE_TAG)
 
     threading.Thread(target=_bg, daemon=True).start()
     return {"delivered": False, "started": True, "task_id": task_id}
 
 
-def _run_conversation_turn(conversation_id: str, message: str) -> None:
-    push = _make_push_callback(conversation_id)
+def _run_conversation_turn(session_id: str, message: str) -> None:
+    from memory.identity_store import try_handle_command, resolve, active_identity_name
+    push = _make_push_callback(session_id)
+
+    # Fixed /identity command — deterministic, doesn't touch the LLM at all.
+    command_reply = try_handle_command(session_id, message)
+    if command_reply is not None:
+        if push:
+            push(command_reply)
+        return
+
+    memory_id = resolve(session_id)
+    needs_identity_check = active_identity_name(session_id) is None
     try:
-        with _turn_lock_for(conversation_id):
+        with _turn_lock_for(memory_id):
             reply, already_delivered = conversation_runner.handle_turn(
-                conversation_id, message, llm=_llm, mem_store=_store,
+                session_id, memory_id, message, llm=_llm, mem_store=_store,
                 episode_store=_episodes, conv_store=_conversations,
                 dispatch_fn=_dispatch_task_for_conversation,
+                needs_identity_check=needs_identity_check,
             )
         if reply and not already_delivered and push:
             push(reply)
     except Exception as e:
-        print(f"[api] conversation turn failed for {conversation_id}: {e}", file=sys.stderr)
+        print(f"[api] conversation turn failed for {session_id}: {e}", file=sys.stderr)
         traceback.print_exc()
         if push:
             push(T.channel_task_failed(str(e)[:500]))

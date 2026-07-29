@@ -9,8 +9,10 @@ memory_write/dispatch_task 三个，最终目的是要么直接聊完，要么�
 
 调用方（api.py 的 /chat、luclas.py 的交互式 REPL）负责提供 dispatch_fn——一个
 "如何真正执行一个任务"的回调，因为前台/后台任务派发要复用各自入口已有的
-push/进度展示机制，这里不重复实现。dispatch_fn(conversation_id, goal,
-foreground) -> {"delivered": bool, ...} 的约定见 _build_tools()。
+push/进度展示机制，这里不重复实现。dispatch_fn(session_id, memory_id, goal,
+foreground) -> {"delivered": bool, ...} 的约定见 _build_tools()。session_id
+是物理渠道连接（任务推送/追踪用），memory_id 是身份切换解析后的对话历史
+归属（可能和 session_id 不同，见 memory/identity_store.py）。
 
 话题切换检测：agent_turn() 返回的就是 OpenAI 风格 message 的 content/
 tool_calls 原始字段，没有任何"thinking vs 最终回复"的结构化切分可以复用
@@ -24,6 +26,7 @@ import re
 
 import i18n as T
 from memory.conversation_store import TASK_EPISODE_TAG
+from memory.identity_store import SWITCH_IDENTITY_SCHEMA, switch_identity_tool
 from tools.registry import execute_tool
 
 CONVERSATION_MAX_ITERATIONS = 6
@@ -59,21 +62,33 @@ DISPATCH_TASK_SCHEMA = {
 }
 
 
-def _system_prompt() -> str:
+def _system_prompt(identity_label: str = "", needs_identity_check: bool = False) -> str:
+    identity_line = f"当前接的是「{identity_label}」的记忆。\n" if identity_label else "当前是本渠道默认的记忆(还没人切换过身份)。\n"
+    identity_guidance = (
+        "需要回忆更早之前的事时用 memory_search；确认值得长期记住的事实/经验用 memory_write。\n"
+        "如果对方说'我是XX'、'切换到XX的记忆'之类的话，调用 switch_identity 把这条连接接到那个人的记忆上——"
+        "switch_identity 可能返回 status=ambiguous（名字和好几个已知身份都很像），这种情况要反问对方是哪一个，不要自己瞎猜。\n"
+    )
+    if needs_identity_check:
+        identity_guidance += (
+            "这是这条连接的第一条消息，你还不知道对方是谁——如果对方这句话里已经表明了身份"
+            "（比如'我是Gia'），直接调用 switch_identity；否则先问清楚对方是谁，再继续聊正事。\n"
+        )
     return (
         "你是 Luclas，一个持续在线、能记住最近对话的个人助理，不是每条消息都独立处理的问答机器人。\n"
+        + identity_line +
         "可以直接聊天回答问题；当用户的请求需要你实际去做一件事（搜索、执行操作、写文件、"
         "跑多步骤的任务等）时，调用 dispatch_task 工具把它派发出去执行，不要自己假装完成。\n"
-        "需要回忆更早之前的事时用 memory_search；确认值得长期记住的事实/经验用 memory_write。\n\n"
-        "每次你给出最终文字回复（没有调用任何工具）时，在回复正文结束后另起一行，输出 "
+        + identity_guidance +
+        "\n每次你给出最终文字回复（没有调用任何工具）时，在回复正文结束后另起一行，输出 "
         "<topic>continue</topic>（这轮回复延续的还是当前话题）或 <topic>new</topic>"
         "（这轮回复开启了一个新话题）。这一行本身不会展示给用户，只是内部标记，不确定时用 continue。"
     )
 
 
-def _build_messages(raw_messages: list) -> list:
+def _build_messages(raw_messages: list, identity_label: str, needs_identity_check: bool) -> list:
     convo = [{"role": m["role"], "content": m["content"]} for m in raw_messages]
-    return [{"role": "system", "content": _system_prompt()}] + convo
+    return [{"role": "system", "content": _system_prompt(identity_label, needs_identity_check)}] + convo
 
 
 def _strip_topic_tag(content: str) -> tuple:
@@ -109,7 +124,7 @@ def _resolve_episode_refs(episode_refs: list, episode_store, mem_store) -> str:
     return "参考以下历史记录：\n" + "\n\n".join(parts)
 
 
-def _build_tools(mem_store, episode_store, dispatch_fn, conversation_id):
+def _build_tools(mem_store, episode_store, dispatch_fn, session_id, memory_id):
     from tools.memory_tools import make_memory_tools
     mem_schemas, mem_fns = make_memory_tools(mem_store, episode_store)
     # Only memory_search/memory_write belong to the conversation layer's own
@@ -121,23 +136,35 @@ def _build_tools(mem_store, episode_store, dispatch_fn, conversation_id):
     def dispatch_task(goal: str, foreground: bool = False, episode_refs: list = None) -> dict:
         context_text = _resolve_episode_refs(episode_refs or [], episode_store, mem_store)
         full_goal = f"{context_text}\n\n---\n\n{goal}" if context_text else goal
-        return dispatch_fn(conversation_id, full_goal, foreground)
+        return dispatch_fn(session_id, memory_id, full_goal, foreground)
 
     schemas.append(DISPATCH_TASK_SCHEMA)
     fns["dispatch_task"] = dispatch_task
+
+    schemas.append(SWITCH_IDENTITY_SCHEMA)
+    fns["switch_identity"] = switch_identity_tool(session_id)
     return schemas, fns
 
 
-def handle_turn(conversation_id: str, message: str, llm, mem_store, episode_store,
-                 conv_store, dispatch_fn) -> tuple:
-    """One turn of the persistent conversation. Returns (reply_text,
-    already_delivered) — already_delivered=True means a foreground task
-    dispatch already pushed/printed its own result via the existing
-    progress-display machinery, so the caller must not deliver it again."""
-    conv_store.append_message(conversation_id, "user", message)
-    schemas, fns = _build_tools(mem_store, episode_store, dispatch_fn, conversation_id)
+def handle_turn(session_id: str, memory_id: str, message: str, llm, mem_store, episode_store,
+                 conv_store, dispatch_fn, needs_identity_check: bool = False) -> tuple:
+    """One turn of the persistent conversation. `session_id` is the physical
+    channel connection (used only for dispatch_task/switch_identity's own
+    routing); `memory_id` is the resolved identity conversation whose
+    history this turn actually reads/writes — the two differ once a channel
+    has been switched to someone else's memory (see memory/identity_store.py).
 
-    working = _build_messages(conv_store.get_messages(conversation_id))
+    Returns (reply_text, already_delivered) — already_delivered=True means a
+    foreground task dispatch already pushed/printed its own result via the
+    existing progress-display machinery, so the caller must not deliver it
+    again."""
+    from memory.identity_store import active_identity_name
+    identity_label = active_identity_name(session_id) or ""
+
+    conv_store.append_message(memory_id, "user", message)
+    schemas, fns = _build_tools(mem_store, episode_store, dispatch_fn, session_id, memory_id)
+
+    working = _build_messages(conv_store.get_messages(memory_id), identity_label, needs_identity_check)
     reply_text = ""
     already_delivered = False
     topic_changed = False
@@ -177,11 +204,11 @@ def handle_turn(conversation_id: str, message: str, llm, mem_store, episode_stor
         # Foreground task results already went through their own push and
         # aren't part of a topic-segment — tag them so eviction can drop them
         # once old without needing a topic-close first (see conversation_store.py).
-        conv_store.append_message(conversation_id, "assistant", reply_text,
+        conv_store.append_message(memory_id, "assistant", reply_text,
                                   episode_id=TASK_EPISODE_TAG if already_delivered else None)
     if topic_changed:
-        conv_store.close_topic(conversation_id, episode_store)
+        conv_store.close_topic(memory_id, episode_store)
 
-    conv_store.evict_if_over_threshold(conversation_id, context_length=llm.context_length)
+    conv_store.evict_if_over_threshold(memory_id, context_length=llm.context_length)
 
     return reply_text, already_delivered

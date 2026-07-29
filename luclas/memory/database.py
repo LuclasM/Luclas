@@ -102,6 +102,17 @@ def init_db():
             );
             CREATE INDEX IF NOT EXISTS idx_episodes_conversation ON episodes(conversation_id);
             CREATE INDEX IF NOT EXISTS idx_episodes_compress_rank ON episodes(granularity, importance, freshness);
+
+            -- Cross-channel identity binding — see memory/identity_store.py.
+            -- A session_id (a specific channel connection) can be bound to a
+            -- named identity so its conversation history reads/writes go
+            -- against that identity's shared memory thread instead of the
+            -- channel's own default one.
+            CREATE TABLE IF NOT EXISTS identity_bindings (
+                session_id TEXT PRIMARY KEY,
+                identity   TEXT NOT NULL,
+                updated_at TEXT DEFAULT (datetime('now','localtime'))
+            );
         """)
     _migrate()
 

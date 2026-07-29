@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luclas</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<div id="key-modal" class="modal-overlay" hidden>
+  <div class="modal">
+    <h2>需要 API Key</h2>
+    <p class="muted">在 .env 里配置的 <code>LUC_API_KEY</code>,只保存在这个浏览器的 localStorage 里。</p>
+    <input id="key-input" type="password" placeholder="API Key" autocomplete="off">
+    <button id="key-submit" class="btn btn-primary">保存并继续</button>
+  </div>
+</div>
+
+<div class="app">
+  <nav class="sidebar">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span>Luclas</span>
+    </div>
+    <a href="#chat" data-view="chat" class="nav-item">
+      <span class="nav-icon">&#128172;</span> 对话
+    </a>
+    <a href="#system" data-view="system" class="nav-item">
+      <span class="nav-icon">&#9881;&#65039;</span> 系统管理
+    </a>
+    <a href="#settings" data-view="settings" class="nav-item">
+      <span class="nav-icon">&#128295;</span> 设置
+    </a>
+    <div class="sidebar-footer">
+      <span id="conn-dot" class="conn-dot"></span>
+      <span id="conn-label" class="muted small">连接中…</span>
+    </div>
+  </nav>
+
+  <main class="content">
+
+    <section data-view="chat" class="view">
+      <div class="chat-shell">
+        <div id="chat-messages" class="chat-messages"></div>
+        <form id="chat-form" class="chat-input-row">
+          <textarea id="chat-input" placeholder="给 Luclas 发消息…(Enter 发送,Shift+Enter 换行)" rows="1"></textarea>
+          <button type="submit" class="btn btn-primary">发送</button>
+        </form>
+      </div>
+    </section>
+
+    <section data-view="system" class="view" hidden>
+      <h1>系统管理</h1>
+
+      <div class="grid-cards" id="status-cards"></div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>定时任务</h2>
+          <button id="schedule-add-btn" class="btn btn-small">+ 新建</button>
+        </div>
+        <table class="data-table" id="schedule-table">
+          <thead><tr><th>状态</th><th>名称</th><th>时间</th><th>目标</th><th>渠道</th><th>上次执行</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>核心策略 (core.md)</h2>
+          <select id="core-history-select"><option value="">当前版本</option></select>
+        </div>
+        <pre id="core-content" class="code-block"></pre>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>服务</h2>
+        </div>
+        <button id="restart-btn" class="btn btn-danger">重启 API 服务</button>
+        <span id="restart-status" class="muted small"></span>
+      </div>
+    </section>
+
+    <section data-view="settings" class="view" hidden>
+      <h1>设置</h1>
+
+      <div class="panel">
+        <div class="panel-header"><h2>通用</h2></div>
+        <div id="env-general" class="form-grid"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h2>企业微信</h2></div>
+        <div id="env-wecom" class="form-grid"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h2>WhatsApp</h2></div>
+        <div id="env-whatsapp" class="form-grid"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header"><h2>Discord</h2></div>
+        <div id="env-discord" class="form-grid"></div>
+      </div>
+
+      <div class="panel">
+        <button id="env-save-btn" class="btn btn-primary">保存设置</button>
+        <span id="env-save-status" class="muted small"></span>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          <h2>模型</h2>
+          <div>
+            <button id="models-detect-btn" class="btn btn-small">探测本机模型</button>
+            <button id="models-add-btn" class="btn btn-small">+ 新增</button>
+          </div>
+        </div>
+        <table class="data-table" id="models-table">
+          <thead><tr><th></th><th>ID</th><th>名称</th><th>Base URL</th><th>复杂度</th><th>优先级</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div id="models-detect-result"></div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script src="js/api.js"></script>
+<script src="js/router.js"></script>
+<script src="js/modal.js"></script>
+<script src="js/chat.js"></script>
+<script src="js/system.js"></script>
+<script src="js/settings.js"></script>
+</body>
+</html>
