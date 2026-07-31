@@ -9,8 +9,17 @@ from __future__ import annotations
 
 import datetime
 import os
+import threading
 
 from config import BASE_DIR
+
+# Guards the read-modify-write below against two concurrent writers (e.g.
+# two browser tabs both saving Settings) silently losing one's changes —
+# same class of race the rest of the codebase guards against with per-id
+# locks (see memory/conversation_store.py). A single process-wide lock is
+# enough here since .env writes are rare, human-triggered admin actions,
+# not a hot path.
+_write_lock = threading.Lock()
 
 # Keys the Settings page is allowed to write. Anything else is rejected —
 # without this, the endpoint would be a generic "write any key into this
@@ -76,36 +85,37 @@ def write_env(new_vars: dict[str, str], base_dir: str = BASE_DIR) -> None:
     temp-file + atomic rename so a crash mid-write can't leave a truncated
     .env behind."""
     env_path = os.path.join(base_dir, ".env")
-    lines: list[str] = []
-    updated: set[str] = set()
+    with _write_lock:
+        lines: list[str] = []
+        updated: set[str] = set()
 
-    if os.path.isfile(env_path):
-        with open(env_path, encoding="utf-8") as f:
-            for line in f:
-                stripped = line.rstrip("\n")
-                if stripped and not stripped.startswith("#") and "=" in stripped:
-                    k = stripped.split("=", 1)[0].strip()
-                    if k in new_vars:
-                        lines.append(f"{k}={new_vars[k]}\n")
-                        updated.add(k)
-                        continue
-                lines.append(line if line.endswith("\n") else line + "\n")
+        if os.path.isfile(env_path):
+            with open(env_path, encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.rstrip("\n")
+                    if stripped and not stripped.startswith("#") and "=" in stripped:
+                        k = stripped.split("=", 1)[0].strip()
+                        if k in new_vars:
+                            lines.append(f"{k}={new_vars[k]}\n")
+                            updated.add(k)
+                            continue
+                    lines.append(line if line.endswith("\n") else line + "\n")
 
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_path = f"{env_path}.bak.{ts}"
-        with open(env_path, encoding="utf-8") as src, open(backup_path, "w", encoding="utf-8") as dst:
-            dst.write(src.read())
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = f"{env_path}.bak.{ts}"
+            with open(env_path, encoding="utf-8") as src, open(backup_path, "w", encoding="utf-8") as dst:
+                dst.write(src.read())
 
-    new_keys = {k: v for k, v in new_vars.items() if k not in updated}
-    if new_keys:
-        if lines and lines[-1].strip():
-            lines.append("\n")
-        for k, v in new_keys.items():
-            lines.append(f"{k}={v}\n")
+        new_keys = {k: v for k, v in new_vars.items() if k not in updated}
+        if new_keys:
+            if lines and lines[-1].strip():
+                lines.append("\n")
+            for k, v in new_keys.items():
+                lines.append(f"{k}={v}\n")
 
-    tmp_path = f"{env_path}.tmp-{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp_path, env_path)
+        tmp_path = f"{env_path}.tmp-{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, env_path)

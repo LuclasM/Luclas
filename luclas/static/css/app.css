@@ -131,6 +131,10 @@ body {
   display: flex;
 }
 
+.view[hidden] {
+  display: none !important;
+}
+
 .chat-shell {
   display: flex;
   flex-direction: column;

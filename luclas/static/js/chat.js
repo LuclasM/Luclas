@@ -33,11 +33,23 @@ const Chat = (() => {
     const url = `/sse/chat?session_id=${encodeURIComponent(sessionId())}&key=${encodeURIComponent(Api.getKey())}`;
     source = new EventSource(url);
     source.onmessage = (e) => appendMessage("assistant", e.data);
-    source.onerror = () => {
-      // EventSource auto-retries; if the key is wrong it'll just keep
-      // failing — surface that once rather than spamming reconnect attempts.
-      if (source.readyState === EventSource.CLOSED) {
+    source.onerror = async () => {
+      // A transient network blip leaves the browser auto-retrying on its
+      // own (readyState CONNECTING) — nothing to do here. CLOSED means the
+      // browser has given up for good, which is exactly what a 401 (bad/
+      // rotated key) produces, but EventSource never exposes the actual
+      // status code. Tell them apart with a real auth check: if the key
+      // turns out to be invalid, Api.get() already clears it and pops the
+      // key-entry modal (see api.js) — wait for luc:key-ready to reconnect
+      // instead of retrying blindly with a key we now know is bad. If the
+      // key is fine, the failure was something else (e.g. the API service
+      // restarting), so retry after a short delay.
+      if (source.readyState !== EventSource.CLOSED) return;
+      try {
+        await Api.get("/status");
         setTimeout(connectStream, 3000);
+      } catch (e) {
+        // key was invalid — Api.get() already surfaced the key modal.
       }
     };
   }

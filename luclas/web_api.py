@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -19,6 +20,11 @@ from config import MODELS_CONFIG_PATH
 import env_store
 from memory.schedule import ScheduledTaskStore
 from tools.core_tools import list_core_snapshots, load_core, read_core_snapshot
+
+# Guards models.json's read-modify-write cycle (_load_models_raw ->
+# mutate -> _save_models_raw) against two concurrent requests losing an
+# update to each other — same rationale as env_store.py's _write_lock.
+_models_lock = threading.Lock()
 
 system_router = APIRouter(prefix="/api/system", dependencies=[Depends(_auth)])
 settings_router = APIRouter(prefix="/api/settings", dependencies=[Depends(_auth)])
@@ -219,34 +225,37 @@ def list_models():
 
 @settings_router.post("/models")
 def create_model(req: ModelUpsert):
-    models = _load_models_raw()
-    if any(m["id"] == req.id for m in models):
-        raise HTTPException(status_code=409, detail=f"model id {req.id!r} already exists")
-    models.append(req.model_dump())
-    _save_models_raw(models)
+    with _models_lock:
+        models = _load_models_raw()
+        if any(m["id"] == req.id for m in models):
+            raise HTTPException(status_code=409, detail=f"model id {req.id!r} already exists")
+        models.append(req.model_dump())
+        _save_models_raw(models)
     _reload_llm_router()
     return _mask(req.model_dump())
 
 
 @settings_router.patch("/models/{model_id}")
 def patch_model(model_id: str, req: ModelPatch):
-    models = _load_models_raw()
-    for m in models:
-        if m["id"] == model_id:
-            m.update({k: v for k, v in req.model_dump(exclude_unset=True).items()})
-            _save_models_raw(models)
-            _reload_llm_router()
-            return _mask(m)
-    raise HTTPException(status_code=404, detail="model not found")
+    with _models_lock:
+        models = _load_models_raw()
+        for m in models:
+            if m["id"] == model_id:
+                m.update({k: v for k, v in req.model_dump(exclude_unset=True).items()})
+                _save_models_raw(models)
+                _reload_llm_router()
+                return _mask(m)
+        raise HTTPException(status_code=404, detail="model not found")
 
 
 @settings_router.delete("/models/{model_id}")
 def delete_model(model_id: str):
-    models = _load_models_raw()
-    remaining = [m for m in models if m["id"] != model_id]
-    if len(remaining) == len(models):
-        raise HTTPException(status_code=404, detail="model not found")
-    _save_models_raw(remaining)
+    with _models_lock:
+        models = _load_models_raw()
+        remaining = [m for m in models if m["id"] != model_id]
+        if len(remaining) == len(models):
+            raise HTTPException(status_code=404, detail="model not found")
+        _save_models_raw(remaining)
     _reload_llm_router()
     return {"deleted": model_id}
 

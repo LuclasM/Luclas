@@ -20,7 +20,7 @@ from memory.database import get_conn
 
 IDENTITY_PREFIX = "identity_"
 _CLEAR_WORDS = {"", "clear", "self", "me"}
-_COMMAND_RE = re.compile(r'^/identity\s*(\S*)\s*$', re.IGNORECASE)
+_COMMAND_RE = re.compile(r'^/identity(?:\s+(.+))?\s*$', re.IGNORECASE)
 
 
 def _normalize(name: str) -> str:
@@ -91,10 +91,20 @@ def resolve_or_bind(session_id: str, claimed_name: str) -> dict:
     implementation of the matching rules.
 
     Returns one of:
-      {"status": "matched", "identity": name}                       — exact or confident-typo match to an EXISTING identity
-      {"status": "matched", "identity": name, "corrected_from": x}  — same, but x was a typo of name
+      {"status": "matched", "identity": name}                       — exact match to an EXISTING identity
+      {"status": "matched", "identity": name, "corrected_from": x}  — confident typo-correction to an EXISTING identity
       {"status": "ambiguous", "candidates": [...], "claimed": x}    — not confident enough to bind; caller should ask
       {"status": "created", "identity": name}                      — no reasonable match (or first identity ever); bound as new
+
+    Short names (<=4 chars) never get silent auto-correction, even at edit
+    distance 1 — a 1-character difference in a 3-4 letter name is not a
+    reliable typo signal (e.g. "gia" vs "pia"/"nia"/"ria"/"kia" are all
+    distance 1 from each other but are plainly different names), so for
+    those lengths every fuzzy hit is treated as ambiguous and asked about
+    rather than silently merging two different people's memory. Confident
+    auto-correction only kicks in for longer names, where a 1-character
+    edit is a much smaller fraction of the string and much more likely to
+    genuinely be a typo (e.g. "gianna" vs "giana").
     """
     name = _normalize(claimed_name)
     known = list_known_identities()
@@ -107,17 +117,18 @@ def resolve_or_bind(session_id: str, claimed_name: str) -> dict:
         set_active_identity(session_id, name)
         return {"status": "created", "identity": name}
 
+    is_short = len(name) <= 4
     scored = sorted((_levenshtein(name, k), k) for k in known)
     best_dist, best_name = scored[0]
-    threshold = 1 if len(name) <= 4 else 2
     tie = len(scored) > 1 and scored[1][0] == best_dist
+    ambiguous_threshold = 1 if is_short else 2
 
-    if best_dist <= threshold and not tie:
+    if not is_short and best_dist <= 1 and not tie:
         set_active_identity(session_id, best_name)
         return {"status": "matched", "identity": best_name, "corrected_from": name}
 
-    if best_dist <= threshold + 1:
-        candidates = [k for d, k in scored if d <= best_dist + 1]
+    if best_dist <= ambiguous_threshold:
+        candidates = [k for d, k in scored if d <= ambiguous_threshold]
         return {"status": "ambiguous", "candidates": candidates, "claimed": name}
 
     set_active_identity(session_id, name)
@@ -145,7 +156,7 @@ def try_handle_command(session_id: str, message: str) -> str | None:
     m = _COMMAND_RE.match(message.strip())
     if not m:
         return None
-    name = m.group(1).strip()
+    name = (m.group(1) or "").strip()
     if _normalize(name) in _CLEAR_WORDS:
         clear_active_identity(session_id)
         return "已切换回本渠道自己的记忆。"

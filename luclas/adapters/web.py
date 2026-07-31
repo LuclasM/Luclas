@@ -14,6 +14,7 @@ import asyncio
 import os
 import queue
 import threading
+import time
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from starlette.responses import StreamingResponse
@@ -25,10 +26,34 @@ _API_KEY = os.environ.get("LUC_API_KEY", "")
 _PING_INTERVAL_SECONDS = 20
 _BACKLOG_LIMIT = 200  # per session_id; old entries are dropped once exceeded
 
+# Every distinct session_id ever pushed to (e.g. a new browser tab that never
+# set an identity) leaves a _backlog/_next_seq entry that unregister() alone
+# never cleans up — a slow, unbounded-in-count (though bounded-in-size-each)
+# memory leak for the life of the process. Swept lazily on every push() —
+# same style as api.py's _purge_old_results — rather than a background
+# thread/timer, since pushes already happen often enough to keep this fresh.
+_STALE_SESSION_TTL_SECONDS = 24 * 3600
+
 _lock = threading.Lock()
 _streams: dict[str, list["queue.Queue"]] = {}
 _backlog: dict[str, list[tuple[int, str]]] = {}
 _next_seq: dict[str, int] = {}
+_last_touch: dict[str, float] = {}
+
+
+def _purge_stale_sessions_locked(now: float) -> None:
+    """Must be called with _lock already held. Only ever drops sessions with
+    zero live connections — an open tab is never evicted out from under
+    itself no matter how old its backlog is."""
+    cutoff = now - _STALE_SESSION_TTL_SECONDS
+    stale = [
+        sid for sid, touched in _last_touch.items()
+        if touched < cutoff and not _streams.get(sid)
+    ]
+    for sid in stale:
+        _last_touch.pop(sid, None)
+        _backlog.pop(sid, None)
+        _next_seq.pop(sid, None)
 
 
 def push(session_id: str, content: str) -> None:
@@ -36,6 +61,8 @@ def push(session_id: str, content: str) -> None:
     session, and buffer it so a tab that reconnects shortly after (or wasn't
     open yet when this was called) can still catch up via backlog_since."""
     with _lock:
+        now = time.time()
+        _last_touch[session_id] = now
         seq = _next_seq.get(session_id, 0) + 1
         _next_seq[session_id] = seq
         buf = _backlog.setdefault(session_id, [])
@@ -43,6 +70,7 @@ def push(session_id: str, content: str) -> None:
         if len(buf) > _BACKLOG_LIMIT:
             del buf[: len(buf) - _BACKLOG_LIMIT]
         queues = list(_streams.get(session_id, []))
+        _purge_stale_sessions_locked(now)
     for q in queues:
         q.put_nowait((seq, content))
 
@@ -51,6 +79,7 @@ def register(session_id: str) -> "queue.Queue":
     q: "queue.Queue" = queue.Queue()
     with _lock:
         _streams.setdefault(session_id, []).append(q)
+        _last_touch[session_id] = time.time()
     return q
 
 
@@ -78,13 +107,20 @@ def _format_sse(seq: int, content: str) -> str:
 
 
 async def _event_stream(request: Request, session_id: str, last_event_id: str):
+    # register() happens before the backlog is read, so a push() landing in
+    # between is both appended to the backlog AND put_nowait'd straight into
+    # our queue — without tracking the highest seq already replayed from the
+    # backlog and skipping it again from the live queue, that message would
+    # be delivered twice.
     q = register(session_id)
     try:
         try:
             last_seq = int(last_event_id) if last_event_id else 0
         except ValueError:
             last_seq = 0
+        max_yielded = last_seq
         for seq, content in backlog_since(session_id, last_seq):
+            max_yielded = max(max_yielded, seq)
             yield _format_sse(seq, content)
 
         while True:
@@ -95,6 +131,9 @@ async def _event_stream(request: Request, session_id: str, last_event_id: str):
             except queue.Empty:
                 yield ": ping\n\n"
                 continue
+            if seq <= max_yielded:
+                continue
+            max_yielded = seq
             yield _format_sse(seq, content)
     finally:
         unregister(session_id, q)

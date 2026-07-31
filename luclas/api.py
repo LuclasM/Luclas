@@ -524,10 +524,15 @@ def status():
 @app.post("/chat", response_model=ChatResponse, dependencies=[Depends(_auth)])
 def chat(req: ChatRequest):
     """
-    session_id doubles as the persistent conversation's own id (see
-    memory/conversation_store.py) — messaging adapters already derive a
-    stable per-user id in exactly this format ("wecom_<UserID>" etc.), so
-    the conversation layer needs no separate identity concept.
+    session_id is the physical channel connection — messaging adapters
+    already derive a stable per-user id in exactly this format
+    ("wecom_<UserID>" etc.). By default it also doubles as the persistent
+    conversation's own id (see memory/conversation_store.py), but that's
+    only the default: _run_conversation_turn resolves the *actual* memory
+    id via memory/identity_store.py, which can differ from session_id once
+    this channel has been switched to someone else's identity ("我是Gia").
+    Task dispatch/push/the supplement-queue mechanism below all still key
+    off the raw session_id regardless — only conversation history moves.
 
     Cron-submitted tasks (session_id prefixed "cron_") bypass the
     conversation layer entirely and keep going through _run_task() exactly
