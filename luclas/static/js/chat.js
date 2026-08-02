@@ -29,6 +29,13 @@ const Chat = (() => {
   }
 
   function connectStream() {
+    // On a first-ever visit the key modal is still showing and Api.getKey()
+    // is still empty at this point (DOMContentLoaded's initial show("chat")
+    // fires before the user has had a chance to type anything in) — skip
+    // connecting with a key we already know is blank rather than burning a
+    // guaranteed-401 round trip; luc:key-ready fires this again once a key
+    // is actually submitted.
+    if (!Api.getKey()) return;
     if (source) source.close();
     const url = `/sse/chat?session_id=${encodeURIComponent(sessionId())}&key=${encodeURIComponent(Api.getKey())}`;
     source = new EventSource(url);

@@ -139,8 +139,25 @@ app.include_router(settings_router)
 # Web UI static frontend, mounted at /ui (not "/") so a typo'd API path
 # still 404s instead of being swallowed by StaticFiles' html=True fallback.
 from fastapi.staticfiles import StaticFiles
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """Plain StaticFiles sends no Cache-Control header at all, which leaves
+    it up to each browser's own caching heuristics whether a JS/CSS fix
+    actually reaches an already-open tab or a returning visit — this has
+    already caused real confusion twice (a CSS fix and a JS fix both
+    silently not taking effect until a manual hard-refresh). ETag-based
+    conditional requests (already sent by default) make "no-cache" cheap:
+    an unchanged file still comes back as a 304, only a real change forces
+    a full re-fetch."""
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-app.mount("/ui", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
+app.mount("/ui", _NoCacheStaticFiles(directory=STATIC_DIR, html=True), name="ui")
 
 
 # ---------------------------------------------------------------------------
