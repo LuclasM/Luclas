@@ -604,6 +604,23 @@ def chat(req: ChatRequest):
     return {"task_id": task_id, "status": "running"}
 
 
+@app.get("/chat/history", dependencies=[Depends(_auth)])
+def chat_history(session_id: str):
+    """Persisted turns for a session's chat view — what F5 re-primes the UI
+    from, since the SSE backlog (adapters/web.py) only ever held assistant
+    pushes and was never meant as a history store on its own. Resolves
+    through identity_store the same way a live turn would, so a channel
+    that's switched to someone else's memory sees that identity's history
+    here too, not its own empty default thread. Also returns the sender's
+    current backlog seq so the caller's first SSE connect can pass it back
+    as `since` and skip re-replaying the assistant replies this history
+    already includes (see adapters/web.py's current_seq)."""
+    from memory.identity_store import resolve
+    from adapters.web import current_seq
+    memory_id = resolve(session_id)
+    return {"messages": _conversations.get_messages(memory_id), "last_seq": current_seq(session_id)}
+
+
 @app.get("/result/{task_id}", response_model=ResultResponse, dependencies=[Depends(_auth)])
 def get_result(task_id: str):
     """Poll for the result of a submitted task."""

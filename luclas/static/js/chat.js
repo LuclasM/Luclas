@@ -9,6 +9,12 @@ const Chat = (() => {
   const formEl = document.getElementById("chat-form");
   const inputEl = document.getElementById("chat-input");
   let source = null;
+  let historyLoaded = false;
+  // Seq of the newest assistant push already accounted for — starts at 0
+  // (replay everything) but loadHistory() moves it forward past whatever
+  // GET /chat/history already rendered, so connectStream()'s first SSE
+  // connect doesn't re-append those same replies from the backlog.
+  let lastSeq = 0;
 
   function sessionId() {
     let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
@@ -28,6 +34,24 @@ const Chat = (() => {
     return div;
   }
 
+  // Persisted conversation history (ConversationStore, keyed through
+  // identity resolution same as a live turn) — this is the source of truth
+  // for anything already said; the SSE backlog below is only for messages
+  // pushed after this loaded (see lastSeq/`since`). Guarded by historyLoaded
+  // so a second trigger (key-ready firing after Router.onEnter already ran,
+  // or vice versa) doesn't render everything twice.
+  async function loadHistory() {
+    if (historyLoaded) return;
+    historyLoaded = true;
+    try {
+      const data = await Api.get(`/chat/history?session_id=${encodeURIComponent(sessionId())}`);
+      (data.messages || []).forEach((m) => appendMessage(m.role, m.content));
+      lastSeq = data.last_seq || 0;
+    } catch (e) {
+      historyLoaded = false; // let the next trigger retry instead of leaving history blank forever
+    }
+  }
+
   function connectStream() {
     // On a first-ever visit the key modal is still showing and Api.getKey()
     // is still empty at this point (DOMContentLoaded's initial show("chat")
@@ -37,9 +61,17 @@ const Chat = (() => {
     // is actually submitted.
     if (!Api.getKey()) return;
     if (source) source.close();
-    const url = `/sse/chat?session_id=${encodeURIComponent(sessionId())}&key=${encodeURIComponent(Api.getKey())}`;
+    const url = `/sse/chat?session_id=${encodeURIComponent(sessionId())}&key=${encodeURIComponent(Api.getKey())}&since=${lastSeq}`;
     source = new EventSource(url);
-    source.onmessage = (e) => appendMessage("assistant", e.data);
+    source.onmessage = (e) => {
+      appendMessage("assistant", e.data);
+      // Keep pace with the stream so a later manual reconnect (onerror's
+      // retry below) resumes from here instead of replaying from the point
+      // history left off — EventSource's own auto-reconnect already tracks
+      // this via Last-Event-ID, but that manual retry builds a brand new
+      // EventSource and only has whatever `since` closed over.
+      if (e.lastEventId) lastSeq = parseInt(e.lastEventId, 10) || lastSeq;
+    };
     source.onerror = async () => {
       // A transient network blip leaves the browser auto-retrying on its
       // own (readyState CONNECTING) — nothing to do here. CLOSED means the
@@ -92,6 +124,12 @@ const Chat = (() => {
     }
   });
 
-  document.addEventListener("luc:key-ready", connectStream);
-  Router.onEnter("chat", () => { if (!source) connectStream(); });
+  async function start() {
+    if (!Api.getKey()) return;
+    await loadHistory();
+    connectStream();
+  }
+
+  document.addEventListener("luc:key-ready", start);
+  Router.onEnter("chat", () => { if (!source) start(); });
 })();

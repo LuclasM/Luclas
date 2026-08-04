@@ -98,6 +98,16 @@ def backlog_since(session_id: str, last_seq: int) -> list[tuple[int, str]]:
         return [(s, m) for s, m in buf if s > last_seq]
 
 
+def current_seq(session_id: str) -> int:
+    """Highest seq already pushed for this session — a fresh page load that
+    primes its message list from GET /chat/history (persisted conversation
+    history, which already has every past user/assistant turn) passes this
+    back as `since` on its first SSE connect so the backlog replay below
+    doesn't re-append those same assistant replies a second time."""
+    with _lock:
+        return _next_seq.get(session_id, 0)
+
+
 def _format_sse(seq: int, content: str) -> str:
     # A message may contain newlines — each line needs its own "data:"
     # prefix per the SSE spec, or everything after the first line break is
@@ -140,14 +150,19 @@ async def _event_stream(request: Request, session_id: str, last_event_id: str):
 
 
 @router.get("/sse/chat")
-async def sse_chat(request: Request, session_id: str = Query(...), key: str = Query("")):
+async def sse_chat(request: Request, session_id: str = Query(...), key: str = Query(""), since: str = Query("")):
     # EventSource can't set a custom X-API-Key header, so the key travels as
     # a query param here specifically — acceptable given this endpoint is no
     # longer reachable from the public tunnel (path allowlist tightened to
     # /wecom/callback and /whatsapp/callback only).
     if _API_KEY and key != _API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing key")
-    last_event_id = request.headers.get("last-event-id", "")
+    # The browser's own automatic reconnect (transient network blip) sets
+    # Last-Event-ID itself and takes priority; `since` is how a freshly
+    # constructed EventSource (page load, or chat.js's manual retry after a
+    # dead connection) supplies the same resume point — EventSource has no
+    # way to set that header on an initial request, only query params.
+    last_event_id = request.headers.get("last-event-id", "") or since
     return StreamingResponse(
         _event_stream(request, session_id, last_event_id),
         media_type="text/event-stream",
