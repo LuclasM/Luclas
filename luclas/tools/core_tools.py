@@ -1,8 +1,18 @@
 import hashlib
 import os
+import re
 import datetime
 from config import CORE_PATH, CORE_LOCAL_PATH, CORE_HIST
 import i18n as T
+
+# core.md sections are tagged with `<!-- segment: general|work -->` comments
+# right before the heading where a section starts. A tag stays in effect for
+# every following line until the next tag, so most headings don't need their
+# own — only the ones where the segment actually changes. "general" =
+# domain-agnostic method (identity, discipline, workflow); "work" = this
+# deployment's business specifics (goals, tag taxonomy, health-check data).
+# Lines before the first tag default to "general" (currently just the title).
+_SEGMENT_TAG_RE = re.compile(r'^<!--\s*segment:\s*(general|work)\s*-->\s*$')
 
 CORE_UPDATE_SCHEMA = {
     "type": "function",
@@ -86,15 +96,36 @@ def core_update(new_content: str, reason: str) -> dict:
     return result
 
 
-def load_core() -> str:
-    """优先加载本地业务定制（core.local.md，不入开源仓库），否则用默认 core.md。"""
+def _filter_segment(content: str, segment: str) -> str:
+    current = "general"
+    out = []
+    for line in content.splitlines(keepends=True):
+        m = _SEGMENT_TAG_RE.match(line.strip())
+        if m:
+            current = m.group(1)
+            continue  # marker line itself never appears in filtered output
+        if current == segment:
+            out.append(line)
+    return "".join(out)
+
+
+def load_core(segment: str = "all") -> str:
+    """优先加载本地业务定制（core.local.md，不入开源仓库），否则用默认 core.md。
+
+    segment="all"（默认）返回磁盘上的原文，不做任何过滤——core_update() 的
+    drift 检测和 /core 展示都依赖这份原始哈希对得上，不能悄悄改动内容。
+    segment="general"/"work" 按 `<!-- segment: ... -->` 标记过滤，只用于挑选
+    某个调用方实际需要的那部分（见 conversation_runner.py）。
+    """
     path = CORE_LOCAL_PATH if os.path.isfile(CORE_LOCAL_PATH) else CORE_PATH
     if not os.path.isfile(path):
         return ""
     with open(path, encoding="utf-8") as f:
         content = f.read()
     _last_loaded_hash[path] = _hash(content)
-    return content
+    if segment == "all":
+        return content
+    return _filter_segment(content, segment)
 
 
 def list_core_snapshots() -> list[dict]:

@@ -27,6 +27,7 @@ import re
 import i18n as T
 from memory.conversation_store import TASK_EPISODE_TAG
 from memory.identity_store import SWITCH_IDENTITY_SCHEMA, switch_identity_tool
+from tools.core_tools import load_core
 from tools.registry import execute_tool
 
 CONVERSATION_MAX_ITERATIONS = 6
@@ -63,27 +64,22 @@ DISPATCH_TASK_SCHEMA = {
 
 
 def _system_prompt(identity_label: str = "", needs_identity_check: bool = False) -> str:
+    """身份/信念/工作纪律，以及 dispatch_task 用法、switch_identity 规则、topic
+    标签协议，全部来自 core.md 的通用段——跟 run_agent() 共用同一份来源，不再
+    在这里维护一份会跟 core.md 脱节的手写副本。这个函数里剩下的只是两条真正
+    意义上的运行时事实，没法预先写进静态文件：这条连接当前挂在谁的记忆上
+    （identity_label，每次调用都可能不同），以及这是不是这条连接的第一条消
+    息（needs_identity_check）。"""
     identity_line = f"当前接的是「{identity_label}」的记忆。\n" if identity_label else "当前是本渠道默认的记忆(还没人切换过身份)。\n"
-    identity_guidance = (
-        "需要回忆更早之前的事时用 memory_search；确认值得长期记住的事实/经验用 memory_write。\n"
-        "如果对方说'我是XX'、'切换到XX的记忆'之类的话，调用 switch_identity 把这条连接接到那个人的记忆上——"
-        "switch_identity 可能返回 status=ambiguous（名字和好几个已知身份都很像），这种情况要反问对方是哪一个，不要自己瞎猜。\n"
-    )
     if needs_identity_check:
-        identity_guidance += (
+        identity_line += (
             "这是这条连接的第一条消息，你还不知道对方是谁——如果对方这句话里已经表明了身份"
             "（比如'我是Gia'），直接调用 switch_identity；否则先问清楚对方是谁，再继续聊正事。\n"
         )
-    return (
-        "你是 Luclas，一个持续在线、能记住最近对话的个人助理，不是每条消息都独立处理的问答机器人。\n"
-        + identity_line +
-        "可以直接聊天回答问题；当用户的请求需要你实际去做一件事（搜索、执行操作、写文件、"
-        "跑多步骤的任务等）时，调用 dispatch_task 工具把它派发出去执行，不要自己假装完成。\n"
-        + identity_guidance +
-        "\n每次你给出最终文字回复（没有调用任何工具）时，在回复正文结束后另起一行，输出 "
-        "<topic>continue</topic>（这轮回复延续的还是当前话题）或 <topic>new</topic>"
-        "（这轮回复开启了一个新话题）。这一行本身不会展示给用户，只是内部标记，不确定时用 continue。"
-    )
+    policy = load_core(segment="general").strip()
+    if not policy:
+        policy = "你是 Luclas，一个持续在线、能记住最近对话的个人助理，不是每条消息都独立处理的问答机器人。"
+    return policy + "\n\n" + identity_line
 
 
 def _build_messages(raw_messages: list, identity_label: str, needs_identity_check: bool) -> list:
