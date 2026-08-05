@@ -39,11 +39,17 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
   background: var(--bg);
   color: var(--text);
+  /* 100vh 在手机浏览器上是按"地址栏收起后的最大高度"算的，但地址栏一开始
+     通常是展开的，实际可见区域比 100vh 矮一截——超出的部分（正好是聊天输
+     入框，在最底下）就被这条 overflow:hidden 裁没了，也没法滚动去够到。
+     100dvh 是跟着地址栏收起/展开实时变化的"当前可见视口高度"，不支持的浏
+     览器会忽略这条声明、退回上面那行 100vh，两条都写等于渐进增强。 */
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
-.app { display: flex; height: 100vh; }
+.app { display: flex; height: 100vh; height: 100dvh; }
 
 /* ── Sidebar ─────────────────────────────────────────── */
 
@@ -128,6 +134,7 @@ body {
 .view[data-view="chat"] {
   padding: 0;
   height: 100vh;
+  height: 100dvh;
   display: flex;
 }
 
@@ -189,6 +196,9 @@ body {
   display: flex;
   gap: 10px;
   padding: 16px 24px 24px;
+  /* 全面屏手机底部的 Home 指示条会挡住紧贴屏幕下边缘的内容；
+     不支持 env() 的浏览器这个 max() 直接退化成后面的 24px。 */
+  padding-bottom: max(24px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--border);
 }
 
@@ -363,9 +373,16 @@ body {
 }
 
 @media (max-width: 720px) {
-  .sidebar { width: 64px; }
+  .sidebar {
+    width: 64px;
+    /* 竖屏 Home 指示条不挡侧边栏，但横屏时刘海/圆角可能吃掉左边缘 */
+    padding-left: max(12px, env(safe-area-inset-left));
+  }
   .sidebar .nav-item span:not(.nav-icon) { display: none; }
   .brand span:last-child { display: none; }
   .content { padding: 18px; }
   .form-grid { grid-template-columns: 1fr; }
+  .chat-messages { padding: 20px 14px 12px; }
+  .chat-input-row { padding-left: 14px; padding-right: 14px; }
+  .msg { max-width: 88%; }
 }
