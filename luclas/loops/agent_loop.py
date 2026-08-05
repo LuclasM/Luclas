@@ -99,6 +99,17 @@ def run_agent(goal: str, task: dict, llm: LLMClient,
 
         # 无工具调用 → 最终回答
         if not tool_calls:
+            if turn.get("finish_reason") == "length":
+                # See conversation_runner.py's handle_turn for the matching
+                # check — a content-only turn that was also truncated means
+                # this "final answer" might really be a tool call the model
+                # never got to finish (e.g. a huge inlined-code dispatch_task
+                # argument that ran past the token cap). Log it so a report
+                # of "it just gave me code/claimed success with no real
+                # output" is diagnosable instead of a shrug.
+                warn_msg = "turn truncated (finish_reason=length, no tool_calls) — final answer may be an incomplete tool-call attempt"
+                print(f"  {warn('⚠')} {warn_msg}")
+                _log(task, f"⚠ {warn_msg}")
             _log(task, f"Final answer: {thinking[:1000]}")
             _save_messages(task["id"], messages)
             return thinking.strip()

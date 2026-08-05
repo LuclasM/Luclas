@@ -137,11 +137,22 @@ class LLMClient:
         if "qwen" in self.model.lower():
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         resp = self._post(payload)
-        msg = resp["choices"][0]["message"]
+        choice = resp["choices"][0]
+        msg = choice["message"]
         return {
-            "content":    msg.get("content"),
-            "tool_calls": msg.get("tool_calls"),
-            "raw":        msg,
+            "content":       msg.get("content"),
+            "tool_calls":    msg.get("tool_calls"),
+            "raw":           msg,
+            # "length" here means the model got cut off mid-generation (hit
+            # the server's max-token cap) — previously discarded entirely,
+            # so a turn that came back with plain-text content and no
+            # tool_calls was indistinguishable from "the model genuinely
+            # chose not to call a tool" vs. "it was mid-attempt and got
+            # truncated before the tool-call could finish." Callers that
+            # care (conversation_runner.py's handle_turn, agent_loop.py's
+            # run_agent) log a warning when this is "length" so a repeat of
+            # that ambiguity is at least diagnosable after the fact.
+            "finish_reason": choice.get("finish_reason"),
         }
 
     def is_available(self) -> bool:

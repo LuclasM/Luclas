@@ -175,6 +175,17 @@ def handle_turn(session_id: str, memory_id: str, message: str, llm, mem_store, e
         tool_calls = turn.get("tool_calls") or []
 
         if not tool_calls:
+            if turn.get("finish_reason") == "length":
+                # Content-only turn AND truncated: this is exactly the shape
+                # of the 2026-08-04 bug where the model dumped a half-written
+                # Python script into the chat reply instead of calling
+                # dispatch_task — it may have been mid-tool-call when the
+                # server cut it off. Surfaced as a print (this loop has no
+                # other log sink) rather than silently handing the truncated
+                # text to the user as if it were a deliberate final answer.
+                print(f"[conversation_runner] turn truncated (finish_reason=length, "
+                      f"no tool_calls) for memory_id={memory_id} — content may be an "
+                      f"incomplete tool-call attempt rather than a real final answer")
             reply_text, topic_changed = _strip_topic_tag(content)
             if not reply_text:
                 reply_text = content.strip()
