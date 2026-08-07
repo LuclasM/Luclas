@@ -118,6 +118,16 @@ body {
 .content {
   flex: 1;
   overflow-y: auto;
+}
+
+/* .content's padding lives on the view itself, not the shared parent, so
+   the chat view (below) can opt out of it entirely — it was previously on
+   .content and applied to every view uniformly, which left the chat view
+   nested inside a padded box while separately sizing itself to the full
+   viewport height (100vh/100dvh): the padding ate into space the chat view
+   had already claimed for itself, pushing the input row 28-36px below the
+   visible fold with no way to reach it except scrolling .content. */
+.view:not([data-view="chat"]) {
   padding: 28px 36px;
 }
 
@@ -133,8 +143,12 @@ body {
 
 .view[data-view="chat"] {
   padding: 0;
-  height: 100vh;
-  height: 100dvh;
+  /* Fills .content's box exactly (a flex item, so its height is already
+     resolved to the available space) instead of re-measuring the viewport
+     independently — that's what let it drift out of sync with .content's
+     own box in the first place. Auto-tracks any window resize since it's
+     just following the flex layout, no viewport unit involved. */
+  height: 100%;
   display: flex;
 }
 
@@ -380,7 +394,7 @@ body {
   }
   .sidebar .nav-item span:not(.nav-icon) { display: none; }
   .brand span:last-child { display: none; }
-  .content { padding: 18px; }
+  .view:not([data-view="chat"]) { padding: 18px; }
   .form-grid { grid-template-columns: 1fr; }
   .chat-messages { padding: 20px 14px 12px; }
   .chat-input-row { padding-left: 14px; padding-right: 14px; }
