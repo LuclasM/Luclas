@@ -42,7 +42,10 @@ MEMORY_SEARCH_SCHEMA = {
     "function": {
         "name": "memory_search",
         "description": (
-            "Search long-term memory: both lessons (experience/opinions/facts, "
+            "Discover long-term-memory candidates without counting them as used. "
+            "Lesson results contain metadata but not their full content; call "
+            "memory_read with the selected lesson ids before relying on them. "
+            "Searches both lessons (experience/opinions/facts, "
             "keyword+type+tag filterable) and episodes (past conversation topics "
             "and finished tasks, keyword-searchable, returned alongside lessons "
             "when a query is given). Each episode result's 'id' can be cited "
@@ -60,6 +63,30 @@ MEMORY_SEARCH_SCHEMA = {
                 "min_credibility":  {"type": "integer", "description": "Minimum credibility filter, 1-10 scale (lessons only)"},
                 "limit":            {"type": "integer", "description": "Max number of results per kind, default 20"},
             },
+        },
+    },
+}
+
+MEMORY_READ_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "memory_read",
+        "description": (
+            "Load the full content of selected lesson ids for actual use. Only "
+            "this operation—not memory_search—raises lesson importance/access "
+            "count and refreshes freshness. Read only lessons relevant to the "
+            "current work."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lesson ids selected from memory_search results",
+                },
+            },
+            "required": ["ids"],
         },
     },
 }
@@ -102,7 +129,7 @@ MEMORY_DELETE_SCHEMA = {
 
 
 def make_memory_tools(store: MemoryStore, episode_store=None):
-    schemas = [MEMORY_WRITE_SCHEMA, MEMORY_SEARCH_SCHEMA,
+    schemas = [MEMORY_WRITE_SCHEMA, MEMORY_SEARCH_SCHEMA, MEMORY_READ_SCHEMA,
                MEMORY_UPDATE_SCHEMA, MEMORY_DELETE_SCHEMA]
 
     def memory_write(content: str, type: str = "", tags: list = None,
@@ -117,7 +144,19 @@ def make_memory_tools(store: MemoryStore, episode_store=None):
         results = store.search(query=query, type=type, tags=tags,
                                min_importance=min_importance, source=source,
                                min_credibility=min_credibility, limit=limit)
-        out = {"count": len(results), "results": results}
+        # A ranked candidate list is not evidence that the model used every
+        # returned lesson. Keep full text behind memory_read so the usage bump
+        # has an observable, exact boundary.
+        candidates = []
+        for result in results:
+            candidate = {k: v for k, v in result.items()
+                         if k not in ("content", "linked_episode_ids")}
+            candidates.append(candidate)
+        out = {
+            "count": len(candidates),
+            "results": candidates,
+            "next_step": "Call memory_read with only the lesson ids you will actually use.",
+        }
         # episode_store is only passed for the conversation layer (see
         # conversation_runner.py) — task-execution's memory_search stays
         # lessons-only, matching its pre-existing behavior.
@@ -128,6 +167,18 @@ def make_memory_tools(store: MemoryStore, episode_store=None):
             out["episodes"] = episodes
             out["count"] += len(episodes)
         return out
+
+    def memory_read(ids: list) -> dict:
+        results = []
+        seen = set()
+        for mid in ids:
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            lesson = store.get_for_use(mid)
+            if lesson:
+                results.append(lesson)
+        return {"count": len(results), "results": results}
 
     def memory_update(id: str, content: str = None, type: str = None,
                       tags: list = None, importance: int = None,
@@ -144,6 +195,7 @@ def make_memory_tools(store: MemoryStore, episode_store=None):
     fns = {
         "memory_write":  memory_write,
         "memory_search": memory_search,
+        "memory_read":   memory_read,
         "memory_update": memory_update,
         "memory_delete": memory_delete,
     }

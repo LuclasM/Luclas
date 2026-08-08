@@ -4,7 +4,7 @@ conversation_runner.py — 持续对话层的轮次主循环
 跟 loops/agent_loop.py 的 run_agent() 不是一回事：run_agent() 是"跑到给出最终
 答案就结束"的任务执行循环（可能上百轮迭代，带 shell/file/web 等干活工具）；
 这里是一个很轻量的、专门服务于持续聊天的循环——工具集只有 memory_search/
-memory_write/dispatch_task 三个，最终目的是要么直接聊完，要么把真正的活儿
+memory_read/memory_write/dispatch_task 等少量工具，最终目的是要么直接聊完，要么把真正的活儿
 通过 dispatch_task 派发给现有的 TaskRunner/run_agent 机制去做。
 
 调用方（api.py 的 /chat、luclas.py 的交互式 REPL）负责提供 dispatch_fn——一个
@@ -54,7 +54,7 @@ DISPATCH_TASK_SCHEMA = {
                 "foreground": {"type": "boolean", "description": "true = show live task progress in place of the conversation; false = run in the background"},
                 "episode_refs": {
                     "type": "array", "items": {"type": "string"},
-                    "description": "Specific episode/task ids (from memory_search results, or ids already visible earlier in this conversation) to pull in as precise extra context for this task",
+                    "description": "Specific episode/task/lesson ids (from memory_search results, or ids already visible earlier in this conversation) to pull in as precise extra context for this task. A lesson listed here counts as actually used.",
                 },
             },
             "required": ["goal"],
@@ -112,7 +112,7 @@ def _resolve_episode_refs(episode_refs: list, episode_store, mem_store) -> str:
             episode_store.reference(ep["id"])
             parts.append(f"[经历 {ep['id']}] {ep['content']}")
             continue
-        lesson = mem_store.get(ref)
+        lesson = mem_store.get_for_use(ref)
         if lesson:
             parts.append(f"[经验 {lesson['id']}] {lesson['content']}")
     if not parts:
@@ -123,11 +123,13 @@ def _resolve_episode_refs(episode_refs: list, episode_store, mem_store) -> str:
 def _build_tools(mem_store, episode_store, dispatch_fn, session_id, memory_id):
     from tools.memory_tools import make_memory_tools
     mem_schemas, mem_fns = make_memory_tools(mem_store, episode_store)
-    # Only memory_search/memory_write belong to the conversation layer's own
+    # Only memory_search/memory_read/memory_write belong to the conversation layer's own
     # tool set — memory_update/memory_delete and everything else (shell/file/
     # web/schedule tools) stay task-execution-only, reachable via dispatch_task.
-    schemas = [s for s in mem_schemas if s["function"]["name"] in ("memory_search", "memory_write")]
-    fns = {k: v for k, v in mem_fns.items() if k in ("memory_search", "memory_write")}
+    schemas = [s for s in mem_schemas if s["function"]["name"] in
+               ("memory_search", "memory_read", "memory_write")]
+    fns = {k: v for k, v in mem_fns.items() if k in
+           ("memory_search", "memory_read", "memory_write")}
 
     def dispatch_task(goal: str, foreground: bool = False, episode_refs: list = None) -> dict:
         context_text = _resolve_episode_refs(episode_refs or [], episode_store, mem_store)
@@ -157,12 +159,13 @@ def handle_turn(session_id: str, memory_id: str, message: str, llm, mem_store, e
     from memory.identity_store import active_identity_name
     identity_label = active_identity_name(session_id) or ""
 
-    conv_store.append_message(memory_id, "user", message)
+    user_message_id = conv_store.append_message(memory_id, "user", message)
     schemas, fns = _build_tools(mem_store, episode_store, dispatch_fn, session_id, memory_id)
 
     working = _build_messages(conv_store.get_messages(memory_id), identity_label, needs_identity_check)
     reply_text = ""
     already_delivered = False
+    delivered_episode_id = ""
     topic_changed = False
 
     for _ in range(CONVERSATION_MAX_ITERATIONS):
@@ -200,6 +203,7 @@ def handle_turn(session_id: str, memory_id: str, message: str, llm, mem_store, e
                 if parsed.get("delivered"):
                     already_delivered = True
                     reply_text = parsed.get("result", "")
+                    delivered_episode_id = parsed.get("episode_id", "")
             working.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result_str})
         if already_delivered:
             break
@@ -207,15 +211,22 @@ def handle_turn(session_id: str, memory_id: str, message: str, llm, mem_store, e
         if not reply_text:
             reply_text = T.sentinel_exceeded_max_iter()
 
+    assistant_message_id = None
     if reply_text:
         # Foreground task results already went through their own push and
         # aren't part of a topic-segment — tag them so eviction can drop them
         # once old without needing a topic-close first (see conversation_store.py).
-        conv_store.append_message(memory_id, "assistant", reply_text,
-                                  episode_id=TASK_EPISODE_TAG if already_delivered else None)
+        assistant_message_id = conv_store.append_message(
+            memory_id, "assistant", reply_text,
+            episode_id=(delivered_episode_id or TASK_EPISODE_TAG)
+            if already_delivered else None)
     if topic_changed:
-        conv_store.close_topic(memory_id, episode_store)
+        move_ids = [user_message_id]
+        if assistant_message_id and not already_delivered:
+            move_ids.append(assistant_message_id)
+        conv_store.split_topic_before_messages(memory_id, episode_store, move_ids)
 
-    conv_store.evict_if_over_threshold(memory_id, context_length=llm.context_length)
+    conv_store.compress_if_over_threshold(
+        memory_id, episode_store, llm, context_length=llm.context_length)
 
     return reply_text, already_delivered

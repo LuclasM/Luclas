@@ -7,8 +7,8 @@ memory/conversation_store.py — 持久对话本体
 （current_episode_id），任务相关的轮次标 "__task__"（不参与话题分段，任务
 完成时直接由 EpisodeStore.create_task_episode 落库，见 conversation_runner.py）。
 
-一旦一段话题关闭（close_topic），它对应的消息就"已经安全落库"，可以在窗口
-超过阈值时被驱逐出活跃窗口而不丢数据——见 evict_if_over_threshold()。
+一旦一段话题关闭（close_topic），它对应的消息就"已经安全落库"；活跃窗口
+达到 50% 时按重要性和新鲜度渐进压缩——见 compress_if_over_threshold()。
 """
 
 import datetime
@@ -18,13 +18,14 @@ import uuid
 
 from memory.database import get_conn
 from memory.token_estimate import estimate_tokens
+import memory.decay as decay
 
 TASK_EPISODE_TAG = "__task__"
-COMPRESS_TRIGGER_RATIO = 0.70
+COMPRESS_TRIGGER_RATIO = 0.50
 COMPRESS_TARGET_RATIO = 0.50
 DEFAULT_CONTEXT_LENGTH = 8192
 
-# append_message()/close_topic()/evict_if_over_threshold() are all read-
+# append_message()/close_topic()/compress_if_over_threshold() are all read-
 # modify-write on the same conversations.messages JSON blob (read the whole
 # row, mutate in Python, write the whole row back) — SQLite's own writer
 # serialization doesn't protect against that, since two threads can each
@@ -68,16 +69,19 @@ class ConversationStore:
                 "created_at": now, "updated_at": now,
             }
 
-    def append_message(self, conversation_id: str, role: str, content: str, episode_id: str = None) -> None:
+    def append_message(self, conversation_id: str, role: str, content: str, episode_id: str = None) -> str:
         with _lock_for(conversation_id):
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             conv = self.get_or_create(conversation_id)
             tag = episode_id or conv["current_episode_id"]
             messages = conv["messages"]
-            messages.append({"role": role, "content": content, "timestamp": now, "episode_id": tag})
+            message_id = uuid.uuid4().hex[:12]
+            messages.append({"id": message_id, "role": role, "content": content,
+                             "timestamp": now, "episode_id": tag})
             with get_conn() as conn:
                 conn.execute("UPDATE conversations SET messages=?, updated_at=? WHERE id=?",
                              (json.dumps(messages, ensure_ascii=False), now, conversation_id))
+            return message_id
 
     def get_messages(self, conversation_id: str) -> list:
         return self.get_or_create(conversation_id)["messages"]
@@ -108,43 +112,142 @@ class ConversationStore:
                              (new_episode_id, conversation_id))
             return current_id
 
-    def evict_if_over_threshold(self, conversation_id: str, context_length: int = DEFAULT_CONTEXT_LENGTH) -> int:
-        """Drop already-closed-episode turns from the live window once usage
-        crosses COMPRESS_TRIGGER_RATIO, down to COMPRESS_TARGET_RATIO. Turns
-        belonging to the still-open topic (current_episode_id) are never
-        evicted this way — only turns whose episode is already safely in
-        the episodes table. Returns how many messages were evicted."""
+    def split_topic_before_messages(self, conversation_id: str, episode_store,
+                                    message_ids: list[str], importance: int = 5) -> str | None:
+        """Put the identified current turn at the start of a new topic.
+
+        Topic classification happens after the assistant has answered, so both
+        the triggering user message and its answer have already been appended.
+        The old implementation archived those messages with the previous topic
+        and opened an empty topic afterwards.  Retag the exact messages (ids are
+        used because a background task result may have appended concurrently),
+        archive only the preceding part, and leave this turn live in the new
+        topic.
+        """
+        wanted = set(message_ids)
+        with _lock_for(conversation_id):
+            conv = self.get_or_create(conversation_id)
+            old_id = conv["current_episode_id"]
+            old_segment = [m for m in conv["messages"]
+                           if m.get("episode_id") == old_id and m.get("id") not in wanted]
+            if old_segment:
+                content = "\n".join(f"{m['role']}: {m['content']}" for m in old_segment)
+                episode_store.close_conversation_episode(
+                    old_id, conversation_id, content, importance=importance)
+            new_id = uuid.uuid4().hex[:12]
+            moved = False
+            for m in conv["messages"]:
+                if m.get("id") in wanted:
+                    m["episode_id"] = new_id
+                    moved = True
+            if not moved:
+                return None
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with get_conn() as conn:
+                conn.execute(
+                    "UPDATE conversations SET messages=?, current_episode_id=?, updated_at=? WHERE id=?",
+                    (json.dumps(conv["messages"], ensure_ascii=False), new_id, now, conversation_id),
+                )
+            return old_id if old_segment else None
+
+    def compress_if_over_threshold(self, conversation_id: str, episode_store, llm,
+                                   context_length: int = DEFAULT_CONTEXT_LENGTH) -> dict:
+        """Immediately and gradually compress dialogue history under pressure.
+
+        At 50% context usage, close the live segment (a storage rollover, not a
+        semantic topic claim), rank closed episodes by importance + decayed
+        freshness, and downgrade the least valuable ones one level per trigger:
+        raw -> summary -> gist -> delete.  The condensed representation replaces
+        raw turns in the live window, so it remains available to the next turn.
+        """
         with _lock_for(conversation_id):
             conv = self.get_or_create(conversation_id)
             messages = conv["messages"]
+
+            def tokens() -> int:
+                return sum(estimate_tokens(m.get("content", "")) for m in messages)
+
+            used = tokens()
+            limit = context_length * COMPRESS_TRIGGER_RATIO
+            if used < limit:
+                return {"triggered": False, "before": used, "after": used, "processed": 0}
+
+            # Strong rollover: make the currently-open segment eligible.  Its
+            # high freshness normally keeps it behind older/lower-value topics.
             current_id = conv["current_episode_id"]
-
-            def total_tokens(msgs):
-                return sum(estimate_tokens(m["content"]) for m in msgs)
-
-            used = total_tokens(messages)
-            if used < context_length * COMPRESS_TRIGGER_RATIO:
-                return 0
-
-            target = context_length * COMPRESS_TARGET_RATIO
-            evicted = 0
-            i = 0
-            while i < len(messages) and used > target:
-                m = messages[i]
-                if m["episode_id"] == current_id:
-                    i += 1
-                    continue
-                used -= estimate_tokens(m["content"])
-                evicted += 1
-                del messages[i]
-                # don't advance i — the list shifted left under us
-
-            if evicted:
-                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            current = [m for m in messages if m.get("episode_id") == current_id]
+            if current:
+                content = "\n".join(f"{m['role']}: {m['content']}" for m in current)
+                episode_store.close_conversation_episode(current_id, conversation_id, content)
+                new_id = uuid.uuid4().hex[:12]
                 with get_conn() as conn:
-                    conn.execute("UPDATE conversations SET messages=?, updated_at=? WHERE id=?",
-                                 (json.dumps(messages, ensure_ascii=False), now, conversation_id))
-            return evicted
+                    conn.execute("UPDATE conversations SET current_episode_id=? WHERE id=?",
+                                 (new_id, conversation_id))
+                conv["current_episode_id"] = new_id
+
+            episode_ids = []
+            for m in messages:
+                eid = m.get("episode_id")
+                if eid and eid not in (conv["current_episode_id"], TASK_EPISODE_TAG) and eid not in episode_ids:
+                    episode_ids.append(eid)
+
+            now = datetime.datetime.now()
+            candidates = []
+            for eid in episode_ids:
+                ep = episode_store.get(eid)
+                if ep:
+                    fresh = decay.compute_freshness(ep.get("freshness"), ep.get("created_at"), now)
+                    candidates.append((decay.rank_key(ep.get("importance"), fresh), ep))
+            candidates.sort(key=lambda item: item[0])
+
+            processed = 0
+            for _, ep in candidates:
+                # At exactly 50%, still perform one step: "reached the ceiling"
+                # includes equality.  Afterwards stop as soon as we are back at
+                # or below the target.
+                if processed and tokens() <= context_length * COMPRESS_TARGET_RATIO:
+                    break
+                eid = ep["id"]
+                gran = ep.get("granularity") or "raw"
+                target = decay.next_granularity(gran)
+                indices = [i for i, m in enumerate(messages) if m.get("episode_id") == eid]
+                if not indices:
+                    continue
+                if target is None:
+                    messages[:] = [m for m in messages if m.get("episode_id") != eid]
+                    episode_store.delete(eid)
+                else:
+                    try:
+                        summary = llm.chat([{
+                            "role": "user",
+                            "content": (
+                                "将下面这段对话历史压缩成更简短的版本。保留用户要求、已确认事实、"
+                                "重要决定、任务状态、文件路径和未完成事项；去掉重复、寒暄和过程细节。"
+                                f"目标颗粒度：{target}。只返回压缩后的内容。\n\n{ep['content']}"
+                            ),
+                        }], temperature=0.2)
+                    except Exception:
+                        # Context maintenance must never turn an otherwise
+                        # successful user turn into a failed turn. Leave this
+                        # episode untouched and try another candidate.
+                        continue
+                    episode_store.update_compressed(eid, summary, target)
+                    first = indices[0]
+                    replacement = {
+                        "id": uuid.uuid4().hex[:12], "role": "system",
+                        "content": f"[历史话题{target}，episode={eid}]\n{summary}",
+                        "timestamp": messages[first].get("timestamp", ""),
+                        "episode_id": eid, "granularity": target, "hidden": True,
+                    }
+                    messages[:] = [m for m in messages if m.get("episode_id") != eid]
+                    messages.insert(min(first, len(messages)), replacement)
+                processed += 1
+
+            now_s = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with get_conn() as conn:
+                conn.execute("UPDATE conversations SET messages=?, updated_at=? WHERE id=?",
+                             (json.dumps(messages, ensure_ascii=False), now_s, conversation_id))
+            return {"triggered": True, "before": used, "after": tokens(), "processed": processed}
 
     def _row(self, r) -> dict:
         return {

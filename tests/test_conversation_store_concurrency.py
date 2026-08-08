@@ -1,6 +1,6 @@
 """
 memory/conversation_store.py's append_message()/close_topic()/
-evict_if_over_threshold() are all read-modify-write on the same
+compress_if_over_threshold() are all read-modify-write on the same
 conversations.messages JSON blob (read the whole row, mutate in Python,
 write the whole row back) — SQLite's writer serialization doesn't protect
 against that, since two threads can each successfully SELECT before either

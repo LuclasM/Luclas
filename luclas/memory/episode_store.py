@@ -101,6 +101,20 @@ class EpisodeStore:
             row = conn.execute("SELECT * FROM episodes WHERE task_id=? ORDER BY created_at DESC LIMIT 1", (task_id,)).fetchone()
             return self._row(row) if row else None
 
+    def update_compressed(self, episode_id: str, content: str, granularity: str) -> bool:
+        """Persist one context-pressure compression step for an episode."""
+        with get_conn() as conn:
+            n = conn.execute(
+                "UPDATE episodes SET content=?, granularity=? WHERE id=?",
+                (content, granularity, episode_id),
+            ).rowcount
+        return n > 0
+
+    def delete(self, episode_id: str) -> bool:
+        with get_conn() as conn:
+            n = conn.execute("DELETE FROM episodes WHERE id=?", (episode_id,)).rowcount
+        return n > 0
+
     def search(self, query: str = "", conversation_id: str = "", limit: int = 5) -> list:
         keywords = [w.strip() for w in query.split() if len(w.strip()) > 1][:5]
         clauses = []

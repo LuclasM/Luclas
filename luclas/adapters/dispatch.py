@@ -74,11 +74,11 @@ def _headers() -> dict:
     return {"X-API-Key": LUC_API_KEY, "Content-Type": "application/json"}
 
 
-def _run_command_and_reply(send: Callable[[str], None], line: str) -> None:
+def _run_command_and_reply(send: Callable[[str], None], line: str, session_id: str) -> None:
     try:
         r = post_with_retry(
             f"{LUC_API_BASE}/command",
-            json={"line": line},
+            json={"line": line, "session_id": session_id},
             headers=_headers(),
             timeout=15,
         ).json()
@@ -142,7 +142,7 @@ def handle_incoming(channel_label: str, notify_channel: str, session_id: str,
     if content.startswith("/"):
         threading.Thread(
             target=_run_command_and_reply,
-            args=(send, content),
+            args=(send, content, session_id),
             daemon=True,
         ).start()
         return

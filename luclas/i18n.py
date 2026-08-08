@@ -147,6 +147,7 @@ def help_text() -> str:
   /core history <file>    View a historical version
   /memory                 View memory (latest 30)
   /memory search <kw>     Search memory
+  /new topic              Close the current topic and start a new one
   /models                 Show configured LLM models
   /models edit            Interactive model manager (add/edit/delete)
   /reflect                Full strategic reflection — improves core.md methodology
@@ -166,6 +167,7 @@ def help_text() -> str:
   /core history <文件名>  查看某个历史版本
   /memory                 查看记忆（最新 30 条）
   /memory search <词>     搜索记忆
+  /new topic              关闭当前话题并开始新话题
   /models                 查看已配置的大模型
   /models edit            交互式模型管理（增删改，上下箭头导航）
   /reflect                全面反思，改进 core.md 方法论

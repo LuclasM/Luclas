@@ -1,4 +1,4 @@
-__version__ = "0.3.17"
+__version__ = "0.3.18"
 
 import builtins
 import datetime
@@ -26,7 +26,7 @@ def _make_llm() -> LLMClient:
     return LLMClient(router=router)
 from memory.database import init_db
 from memory.store import MemoryStore
-from memory.conversation_store import ConversationStore, TASK_EPISODE_TAG
+from memory.conversation_store import ConversationStore
 from memory.episode_store import EpisodeStore
 from tools.registry import build_tools
 from tools.core_tools import load_core, core_update
@@ -206,7 +206,9 @@ def main():
 
         if line.startswith("/"):
             try:
-                _handle_slash(line, llm, store, schemas, fns, runner)
+                _handle_slash(line, llm, store, schemas, fns, runner,
+                              conversation_id=CLI_CONVERSATION_ID,
+                              conv_store=conv_store, episode_store=episode_store)
             except SystemExit:
                 readline.write_history_file(_history_file)
                 _stop_print_logger()
@@ -295,7 +297,8 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
                 if record_in_history:
                     clear_channel_context()
                     _cli_pending_queues.pop(session_id, None)
-            episode_store.create_task_episode(memory_id, uuid.uuid4().hex[:12], result, importance=7)
+            episode_id = episode_store.create_task_episode(
+                memory_id, uuid.uuid4().hex[:12], result, importance=7)
             conv_store.clear_active_task(session_id)
             if record_in_history:
                 # Background dispatch: handle_turn() already returned (its
@@ -307,13 +310,14 @@ def _make_cli_dispatch(conv_store, episode_store, llm, store, schemas, fns):
                 # already_delivered=True). Without this, a background task's
                 # outcome would only ever be visible in the printed terminal
                 # output, never recalled naturally in later conversation turns.
-                conv_store.append_message(memory_id, "assistant", result, episode_id=TASK_EPISODE_TAG)
-            return result
+                conv_store.append_message(memory_id, "assistant", result, episode_id=episode_id)
+            return result, episode_id
 
         task_id = uuid.uuid4().hex[:12]
         conv_store.set_active_task(session_id, task_id, foreground)
         if foreground:
-            return {"delivered": True, "result": _run(record_in_history=False)}
+            result, episode_id = _run(record_in_history=False)
+            return {"delivered": True, "result": result, "episode_id": episode_id}
         threading.Thread(target=_run, kwargs={"record_in_history": True}, daemon=True).start()
         return {"delivered": False, "started": True, "task_id": task_id}
 
@@ -338,7 +342,8 @@ def _run_conversation_turn(message: str, llm, store, episode_store, conv_store, 
 
 # ── 斜杠命令 ──────────────────────────────────────────────
 
-def _handle_slash(line: str, llm, store, schemas, fns, runner=None):
+def _handle_slash(line: str, llm, store, schemas, fns, runner=None,
+                  conversation_id: str = "", conv_store=None, episode_store=None):
     parts = line[1:].split(None, 2)
     cmd  = parts[0].lower() if parts else ""
     sub  = parts[1].lower() if len(parts) > 1 else ""
@@ -366,6 +371,13 @@ def _handle_slash(line: str, llm, store, schemas, fns, runner=None):
             _memory_cmd(f"search {rest}", store)
         else:
             _memory_cmd("", store)
+
+    elif cmd == "new" and sub == "topic":
+        if not conversation_id or conv_store is None or episode_store is None:
+            print(warn("conversation id is required for /new topic"))
+        else:
+            closed = conv_store.close_topic(conversation_id, episode_store)
+            print(ok("New topic started." if closed else "Already at a new empty topic."))
 
     elif cmd == "reset":
         _do_reset(store)

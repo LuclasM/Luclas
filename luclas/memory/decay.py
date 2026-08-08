@@ -1,10 +1,8 @@
-"""Shared importance/freshness/compression logic for episodes ("经历",
-memory/episode_store.py) and lessons ("经验", the memories table in
-memory/store.py). Both share the same compression algorithm — lowest
-importance+freshness compressed first, granularity downgraded one level at
-a time, deleted once already at the coarsest level — they differ only in
-which timestamp column freshness decays from and whether a reference
-refreshes it, which is handled by the callers, not here.
+"""Importance/freshness ranking helpers and legacy episode compression.
+
+Reusable lessons are durable retrieval records and are never compressed here.
+Conversation context uses the ranking helpers from this module for its
+pressure-triggered episode compression.
 """
 from datetime import datetime
 from typing import Optional
@@ -58,12 +56,10 @@ def rank_key(importance: int, freshness: float) -> float:
 
 
 def compress_due(llm, table: str, timestamp_column: str, batch_size: int = COMPRESS_BATCH) -> int:
-    """Generic claim-then-compress pass shared by memory/episode_store.py
-    (table='episodes') and memory/store.py (table='memories') — both tables
-    share the same id/granularity/importance/freshness/content shape needed
-    here, differing only in which column freshness decays from
-    (created_at for episodes, which never refresh on reference; updated_at
-    for lessons, which do — see each store's module docstring).
+    """Claim and compress a batch of legacy episode rows.
+
+    This function is retained for EpisodeStore compatibility. It must not be
+    used for reusable lessons in the ``memories`` table.
 
     Claim-then-process mirrors memory/task_memory.py's now-retired
     maybe_compress(): candidates are claimed via a conditional UPDATE

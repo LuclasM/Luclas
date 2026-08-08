@@ -30,7 +30,7 @@ from llm_client import LLMClient
 from llm_router import ModelRouter, load_models
 from memory.database import init_db
 from memory.store import MemoryStore
-from memory.conversation_store import ConversationStore, TASK_EPISODE_TAG
+from memory.conversation_store import ConversationStore
 from memory.episode_store import EpisodeStore
 from tools.registry import build_tools
 from loops.task_runner import TaskRunner
@@ -360,22 +360,22 @@ def _dispatch_task_for_conversation(session_id: str, memory_id: str, goal: str, 
     def _finish():
         with _lock:
             result = _results.get(task_id, {}).get("result", "")
-        _episodes.create_task_episode(memory_id, task_id, result, importance=7)
+        episode_id = _episodes.create_task_episode(memory_id, task_id, result, importance=7)
         _conversations.clear_active_task(session_id)
-        return result
+        return result, episode_id
 
     if foreground:
         _run_task(task_id, goal, session_id, q, show_progress=True)  # blocks — caller is already off the HTTP thread
-        result = _finish()
-        return {"delivered": True, "result": result}
+        result, episode_id = _finish()
+        return {"delivered": True, "result": result, "episode_id": episode_id}
 
     def _bg():
         _run_task(task_id, goal, session_id, q, show_progress=False)
-        result = _finish()
+        result, episode_id = _finish()
         # _run_task already pushed `result` via its own on_result — only
         # record it into the conversation transcript here, don't push again.
         _conversations.append_message(memory_id, "assistant", result,
-                                      episode_id=TASK_EPISODE_TAG)
+                                      episode_id=episode_id)
 
     threading.Thread(target=_bg, daemon=True).start()
     return {"delivered": False, "started": True, "task_id": task_id}
@@ -491,6 +491,7 @@ def health():
 
 class CommandRequest(BaseModel):
     line: str   # e.g. "/status" or "/memory search foo"
+    session_id: str = ""
 
 
 @app.post("/command", dependencies=[Depends(_auth)])
@@ -498,17 +499,19 @@ def run_command(req: CommandRequest):
     """Run a slash command synchronously and return its text output."""
     import io, contextlib, sys
     from luclas import _handle_slash
+    from memory.identity_store import resolve
     schemas, fns = build_tools(_store)
     buf = io.StringIO()
     try:
-        with contextlib.redirect_stdout(buf):
+        memory_id = resolve(req.session_id) if req.session_id else ""
+        turn_guard = (_turn_lock_for(memory_id)
+                      if memory_id and req.line.strip().lower() == "/new topic"
+                      else contextlib.nullcontext())
+        with turn_guard, contextlib.redirect_stdout(buf):
             _handle_slash(
-                req.line,
-                llm=_llm,
-                store=_store,
-                schemas=schemas,
-                fns=fns,
-            )
+                req.line, llm=_llm, store=_store, schemas=schemas, fns=fns,
+                conversation_id=memory_id, conv_store=_conversations,
+                episode_store=_episodes)
     except SystemExit:
         pass
     except Exception as e:
@@ -566,6 +569,19 @@ def chat(req: ChatRequest):
     """
     session_id = req.session_id or uuid.uuid4().hex[:8]
 
+    # The browser posts directly to /chat rather than going through an
+    # adapter's slash-command route.  Handle the manual topic boundary here
+    # too so /new topic behaves identically on every channel.
+    if req.message.strip().lower() == "/new topic":
+        from memory.identity_store import resolve
+        memory_id = resolve(session_id)
+        with _turn_lock_for(memory_id):
+            closed = _conversations.close_topic(memory_id, _episodes)
+        push = _make_push_callback(session_id)
+        if push:
+            push("New topic started." if closed else "Already at a new empty topic.")
+        return {"task_id": uuid.uuid4().hex[:12], "status": "running"}
+
     if session_id.startswith("cron_"):
         with _lock:
             task_id = uuid.uuid4().hex[:12]
@@ -618,7 +634,8 @@ def chat_history(session_id: str):
     from memory.identity_store import resolve
     from adapters.web import current_seq
     memory_id = resolve(session_id)
-    return {"messages": _conversations.get_messages(memory_id), "last_seq": current_seq(session_id)}
+    messages = [m for m in _conversations.get_messages(memory_id) if not m.get("hidden")]
+    return {"messages": messages, "last_seq": current_seq(session_id)}
 
 
 @app.get("/result/{task_id}", response_model=ResultResponse, dependencies=[Depends(_auth)])
